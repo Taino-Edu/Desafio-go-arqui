@@ -6,6 +6,9 @@
 > que o desafio cobra, e propõe a arquitetura que vamos construir. Ele parte do
 > princípio de que você já sabe Go, mas nunca trabalhou com dinheiro, ledger ou
 > mensageria.
+>
+> Quer a versão sem jargão, com analogias e links de vídeos? Veja
+> [CONCEITOS-EXPLICADOS.md](CONCEITOS-EXPLICADOS.md).
 
 ---
 
