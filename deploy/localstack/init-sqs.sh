@@ -34,4 +34,16 @@ create_fifo_with_dlq "wager-transactions.fifo" "wager-transactions-dlq.fifo"
 # saída: eventos publicados pela outbox
 create_fifo_with_dlq "wallet-events.fifo" "wallet-events-dlq.fifo"
 
+# Política de acesso da fila de entrada (controle no broker). Na AWS, cada
+# provedor publica com o próprio papel IAM e só o papel do consumidor recebe e
+# apaga. O LocalStack Community aceita e guarda a política, mas não a aplica
+# (aplicação de IAM é recurso pago); ela fica aqui como especificação.
+INPUT_URL="http://localhost:4566/${ACCOUNT}/wager-transactions.fifo"
+POLICY=$(cat /etc/localstack/policies/wager-transactions-policy.json 2>/dev/null || true)
+if [ -n "$POLICY" ]; then
+  awslocal sqs set-queue-attributes --queue-url "$INPUT_URL" \
+    --attributes "{\"Policy\": $(printf '%s' "$POLICY" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}" >/dev/null
+  echo "queue policy applied to wager-transactions.fifo"
+fi
+
 echo "sqs init done"

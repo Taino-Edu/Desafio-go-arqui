@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **7 — autenticação e autorização (Keycloak)**.
+> 🚧 Em construção. Fase atual: **8 — consumidor SQS com inbox e DLQ**.
 
 ## Documentação
 
@@ -81,6 +81,22 @@ curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50' -H "Authorization: B
 curl -s localhost:8080/health/ready   # público
 ```
 
+Enviar uma operação pela fila (mesmo efeito e mesma idempotência do HTTP):
+
+```sh
+BODY='{"messageId":"msg-1","type":"WagerTransactionRequested","occurredAt":"2026-09-08T12:00:00Z",
+ "data":{"providerId":"provider-a","externalTransactionId":"transaction-124","idempotencyKey":"provider-a:transaction-124",
+ "playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","walletId":"<walletId>","roundId":"round-987",
+ "gameId":"fortune-chimp","kind":"BET","money":{"amount":"25.00","currency":"BRL"}}}'
+docker compose exec localstack awslocal sqs send-message \
+  --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
+  --message-group-id '<walletId>' --message-deduplication-id msg-1 --message-body "$BODY"
+
+# mensagens que foram para a DLQ (com o motivo)
+docker compose exec localstack awslocal sqs receive-message --message-attribute-names All \
+  --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo
+```
+
 ### Rodar a API fora do Docker
 
 ```sh
@@ -103,6 +119,14 @@ DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=dis
 | `DB_STATEMENT_TIMEOUT` / `DB_LOCK_TIMEOUT` | `5s` / `3s` | limites por comando e por espera de lock |
 | `HTTP_REQUEST_TIMEOUT` | `10s` | prazo de cada requisição |
 | `START_TIMEOUT` / `SHUTDOWN_TIMEOUT` | `30s` / `25s` | prazos de partida e de desligamento gracioso |
+| `SQS_ENABLED` | `true` | liga o consumidor da fila de entrada |
+| `AWS_REGION` / `SQS_ENDPOINT` | `us-east-1` / — | região; endpoint só para LocalStack |
+| `SQS_ACCESS_KEY_ID` / `SQS_SECRET_ACCESS_KEY` | — | só LocalStack; na AWS use o papel IAM |
+| `SQS_INPUT_QUEUE` / `SQS_INPUT_DLQ` | `wager-transactions.fifo` / `wager-transactions-dlq.fifo` | nome ou URL das filas |
+| `SQS_CONSUMER_NAME` | `wager-transactions-consumer` | escopo da inbox |
+| `SQS_POLLERS` / `SQS_MAX_MESSAGES` / `SQS_WAIT_TIME` | `2` / `10` / `10s` | recebimento (long polling) |
+| `SQS_RETRY_BASE_DELAY` / `SQS_RETRY_MAX_DELAY` | `1s` / `1m` | backoff de visibilidade em falha transitória |
+| `SQS_ALLOWED_PROVIDERS` | — (qualquer) | provedores aceitos na fila, separados por vírgula |
 | `REFERENCE_WORKER_ENABLED` | `true` | liga o worker de referências pendentes nesta instância |
 | `REFERENCE_WORKER_INTERVAL` | `1s` | espera do worker quando não há pendência vencida |
 | `REFERENCE_RETRY_BASE_DELAY` / `REFERENCE_RETRY_MAX_DELAY` | `1s` / `5m` | backoff exponencial entre tentativas |
@@ -133,12 +157,15 @@ go test ./...                       # unitários
 go test -race ./...                 # unitários com detector de race condition
 go vet ./...
 
-# integração: Postgres e Keycloak reais, um banco descartável por teste
-docker compose up -d postgres keycloak
+# integração: Postgres, Keycloak e LocalStack reais, um banco (e filas) descartáveis por teste
+docker compose up -d postgres keycloak localstack
 go test -tags=integration -race ./...
 
 # autenticação e isolamento entre provedores (Keycloak real)
 go test -tags=integration -race -run 'TestAuth' ./test/integration/
+
+# SQS: inbox, duplicatas, HTTP x SQS, DLQ, queda após o commit, shutdown (LocalStack real)
+go test -tags=integration -race -run 'TestSQS' ./test/integration/
 
 # só os testes de concorrência e de 3 instâncias (compila cmd/server e sobe 3 processos)
 go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeIndependentInstances' ./test/integration/
@@ -165,12 +192,14 @@ internal/app/                casos de uso e portas (interfaces)
 internal/adapters/postgres/  repositórios pgx, transação (Store), migrations
 internal/adapters/httpapi/   rotas, middlewares (inclusive autenticação), erros, health
 internal/adapters/auth/      validação de JWT do Keycloak (OIDC, JWKS)
+internal/adapters/sqsconsumer/ consumidor SQS (envelope, inbox via app, DLQ, backoff, shutdown)
 internal/platform/config/    configuração por variáveis de ambiente
 internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
 internal/worker/             loop genérico de trabalho em segundo plano (parada observável)
 internal/testsupport/pgtest/ banco descartável para testes de integração
 internal/testsupport/apptest/ aplicação completa + cliente HTTP (com tokens reais) para testes
 internal/testsupport/idptest/ obtém tokens do Keycloak (client_credentials) para os testes
+internal/testsupport/sqstest/ filas FIFO descartáveis no LocalStack para os testes
 test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak

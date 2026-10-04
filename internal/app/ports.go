@@ -31,6 +31,7 @@ type Repositories interface {
 	Transactions() TransactionRepository
 	Ledger() LedgerRepository
 	Outbox() OutboxRepository
+	Inbox() InboxRepository
 }
 
 // WalletRepository persiste carteiras.
@@ -82,6 +83,22 @@ type LedgerRepository interface {
 	// List devolve até limit lançamentos com wallet_version > afterVersion,
 	// em ordem crescente de versão.
 	List(ctx context.Context, walletID uuid.UUID, afterVersion int64, limit int) ([]wallet.LedgerEntry, error)
+}
+
+// InboxEntry é o registro de uma mensagem recebida por um consumidor.
+type InboxEntry struct {
+	PayloadHash string
+	Completed   bool
+}
+
+// InboxRepository deduplica mensagens por (consumidor, messageId).
+type InboxRepository interface {
+	// Register grava a mensagem se for nova. Se outro processo estiver
+	// tratando a mesma mensagem (transação aberta), ESPERA o desfecho.
+	// Devolve o registro existente quando já havia um (inserted = false).
+	Register(ctx context.Context, consumer, messageID, payloadHash string, now time.Time) (existing InboxEntry, inserted bool, err error)
+	// Complete marca a conclusão durável do tratamento.
+	Complete(ctx context.Context, consumer, messageID string, now time.Time) error
 }
 
 // OutboxRepository grava eventos a publicar.

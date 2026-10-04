@@ -420,3 +420,41 @@ func (r transactionRepo) NudgePendingReferences(ctx context.Context, providerID,
 			 FOR UPDATE SKIP LOCKED)`, providerID, externalID, now)
 	return classify(err)
 }
+
+// ---------------------------------------------------------------------
+// inbox_messages
+// ---------------------------------------------------------------------
+
+type inboxRepo struct{ q querier }
+
+// Register: o INSERT espera se outra transação aberta já registrou o mesmo
+// (consumidor, messageId). Quando não insere, lê o registro travando-o.
+func (r inboxRepo) Register(ctx context.Context, consumer, messageID, hash string, now time.Time) (app.InboxEntry, bool, error) {
+	tag, err := r.q.Exec(ctx, `
+		INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, received_at)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (consumer_name, message_id) DO NOTHING`, consumer, messageID, hash, now)
+	if err != nil {
+		return app.InboxEntry{}, false, classify(err)
+	}
+	if tag.RowsAffected() == 1 {
+		return app.InboxEntry{}, true, nil
+	}
+	var e app.InboxEntry
+	var completed *time.Time
+	err = r.q.QueryRow(ctx, `
+		SELECT payload_hash, completed_at FROM inbox_messages
+		 WHERE consumer_name = $1 AND message_id = $2 FOR UPDATE`, consumer, messageID).Scan(&e.PayloadHash, &completed)
+	if err != nil {
+		return app.InboxEntry{}, false, classify(err)
+	}
+	e.Completed = completed != nil
+	return e, false, nil
+}
+
+func (r inboxRepo) Complete(ctx context.Context, consumer, messageID string, now time.Time) error {
+	_, err := r.q.Exec(ctx, `
+		UPDATE inbox_messages SET completed_at = GREATEST($3, received_at)
+		 WHERE consumer_name = $1 AND message_id = $2`, consumer, messageID, now)
+	return classify(err)
+}

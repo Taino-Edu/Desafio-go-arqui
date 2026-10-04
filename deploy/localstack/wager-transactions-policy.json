@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Id": "wager-transactions-access",
+  "Statement": [
+    {
+      "Sid": "ProvidersMaySendOnly",
+      "Effect": "Allow",
+      "Principal": {"AWS": [
+        "arn:aws:iam::000000000000:role/provider-a-publisher",
+        "arn:aws:iam::000000000000:role/provider-b-publisher"
+      ]},
+      "Action": ["sqs:SendMessage"],
+      "Resource": "arn:aws:sqs:us-east-1:000000000000:wager-transactions.fifo"
+    },
+    {
+      "Sid": "WalletServiceConsumesOnly",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::000000000000:role/wallet-service"},
+      "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes", "sqs:GetQueueUrl"],
+      "Resource": "arn:aws:sqs:us-east-1:000000000000:wager-transactions.fifo"
+    }
+  ]
+}

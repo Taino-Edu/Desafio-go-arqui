@@ -21,6 +21,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.HTTP.Addr != ":8080" || cfg.Database.MaxConns != 20 || cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("defaults = %+v", cfg)
 	}
+	if !cfg.SQS.Enabled || cfg.SQS.InputQueue != "wager-transactions.fifo" || cfg.SQS.AllowedProviders != nil {
+		t.Errorf("sqs = %+v", cfg.SQS)
+	}
 	if cfg.Auth.Audience != "wallet-api" {
 		t.Errorf("audience padrão = %q", cfg.Auth.Audience)
 	}
@@ -36,12 +39,14 @@ func TestLoad_Overrides(t *testing.T) {
 	cfg, err := config.Load(env(map[string]string{
 		"DATABASE_URL": "postgres://x", "OIDC_ISSUER": "http://idp/realms/w", "HTTP_ADDR": ":9999", "DB_MAX_CONNS": "5",
 		"LOG_LEVEL": "debug", "SHUTDOWN_TIMEOUT": "40s", "INSTANCE_ID": "i-1",
+		"SQS_ALLOWED_PROVIDERS": " provider-a, provider-b ,",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.HTTP.Addr != ":9999" || cfg.Database.MaxConns != 5 || cfg.LogLevel != slog.LevelDebug ||
-		cfg.ShutdownTimeout != 40*time.Second || cfg.InstanceID != "i-1" {
+		cfg.ShutdownTimeout != 40*time.Second || cfg.InstanceID != "i-1" ||
+		len(cfg.SQS.AllowedProviders) != 2 || cfg.SQS.AllowedProviders[1] != "provider-b" {
 		t.Errorf("cfg = %+v", cfg)
 	}
 }
@@ -62,6 +67,8 @@ func TestLoad_Invalid(t *testing.T) {
 		"lock > requisição":    {map[string]string{"DATABASE_URL": "x", "DB_LOCK_TIMEOUT": "20s"}, "DB_LOCK_TIMEOUT must be shorter"},
 		"booleano inválido":    {map[string]string{"DATABASE_URL": "x", "REFERENCE_WORKER_ENABLED": "talvez"}, "invalid boolean"},
 		"teto < base":          {map[string]string{"DATABASE_URL": "x", "REFERENCE_RETRY_MAX_DELAY": "100ms"}, "REFERENCE_RETRY_MAX_DELAY must be"},
+		"sqs espera longa":     {map[string]string{"DATABASE_URL": "x", "OIDC_ISSUER": "i", "SQS_WAIT_TIME": "30s"}, "SQS_WAIT_TIME must be"},
+		"sqs mensagens":        {map[string]string{"DATABASE_URL": "x", "OIDC_ISSUER": "i", "SQS_MAX_MESSAGES": "11"}, "SQS_MAX_MESSAGES between"},
 		"tentativas zero":      {map[string]string{"DATABASE_URL": "x", "REFERENCE_RETRY_MAX_ATTEMPTS": "0"}, "REFERENCE_RETRY_MAX_ATTEMPTS must be"},
 	}
 	for name, tt := range tests {

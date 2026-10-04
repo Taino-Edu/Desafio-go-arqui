@@ -12,13 +12,13 @@ correspondente é implementada (ver o roteiro em
 | [Banco, migrations e invariantes no schema](#banco-migrations-e-invariantes-no-schema) | ✅ |
 | [Transação SQL entre repositórios](#transação-sql-entre-repositórios) | ✅ |
 | [Contrato HTTP](#contrato-http) | ✅ (reconciliação na fase 10) |
-| [Idempotência](#idempotência) | ✅ HTTP; SQS reutiliza o mesmo caso de uso na fase 8 |
+| [Idempotência](#idempotência) | ✅ HTTP e SQS |
 | [Concorrência e locks](#concorrência-e-locks) | ✅ |
 | [Referências pendentes e worker](#referências-pendentes-e-worker) | ✅ |
-| [Autenticação e autorização](#autenticação-e-autorização) | ✅ HTTP; SQS (credenciais e políticas do broker) na fase 8 |
-| Inbox, SQS e DLQ | ⏳ fase 8 |
+| [Autenticação e autorização](#autenticação-e-autorização) | ✅ HTTP (OIDC) e SQS (credenciais e política do broker) |
+| [Inbox, SQS e DLQ](#inbox-sqs-e-dlq) | ✅ |
 | Outbox | ⏳ fase 9 |
-| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco e worker de referências; SQS e outbox nas fases 8 e 9 |
+| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco, worker de referências e consumidor SQS; outbox na fase 9 |
 | Observabilidade | ⏳ fase 10 |
 
 ---
@@ -393,6 +393,7 @@ Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
 | `postgres` | `*pgxpool.Pool`, `app.Store` | OnStart: ping (sem banco, não sobe). OnStop: fecha o pool |
 | `app` | `Clock`, `IDGenerator`, `WalletService` | — |
 | `http` | `Health`, handler, `*httpapi.Server` | `fx.Invoke` registra OnStart (abre a porta) e OnStop (shutdown gracioso) |
+| `sqs` (se `SQS_ENABLED`) | cliente SQS, `Checker` de readiness | OnStart resolve as URLs das filas (sem filas, não sobe) e inicia os pollers; OnStop para de receber, conclui as mensagens em andamento e libera as não iniciadas |
 | `workers` | — | `fx.Invoke` registra o loop do worker de referências: OnStart inicia a goroutine; OnStop para de buscar trabalho, espera o item em andamento e, se o prazo acabar, cancela o item (a transação é desfeita) |
 
 - **Partida:** `cmd/server` valida a configuração antes do Fx (inválida → sai
@@ -754,5 +755,114 @@ falhou; removendo a comparação `providerId` do corpo × token, o teste de
 isolamento falhou. Os dois clientes `test-*` do realm existem só para esses
 testes.
 
-Mensageria (SQS): credenciais e políticas do broker, com as validações de
-domínio mantidas no consumidor, na fase 8.
+Mensageria (SQS): ver [Inbox, SQS e DLQ](#inbox-sqs-e-dlq), seção "Controle de
+acesso".
+
+---
+
+## Inbox, SQS e DLQ
+
+Arquivos: [`sqsconsumer/consumer.go`](internal/adapters/sqsconsumer/consumer.go),
+[`sqsconsumer/envelope.go`](internal/adapters/sqsconsumer/envelope.go),
+[`app/queue.go`](internal/app/queue.go),
+[`deploy/localstack/init-sqs.sh`](deploy/localstack/init-sqs.sh).
+
+### Filas
+
+| Fila | Tipo | Configuração |
+|---|---|---|
+| `wager-transactions.fifo` | entrada | FIFO, `ContentBasedDeduplication=false`, visibilidade 30s, retenção 4 dias, redrive para a DLQ com `maxReceiveCount=5` |
+| `wager-transactions-dlq.fifo` | DLQ da entrada | FIFO, retenção 14 dias |
+| `wallet-events.fifo` / `-dlq.fifo` | saída (outbox, fase 9) | idem |
+
+**Contrato do produtor:**
+
+- `MessageGroupId = walletId`: o SQS FIFO entrega em ordem dentro de um grupo
+  e não entrega a próxima mensagem do grupo enquanto a anterior está em
+  processamento; carteiras diferentes andam em paralelo.
+- `MessageDeduplicationId = messageId` do envelope: o SQS descarta reenvios
+  do produtor dentro de 5 minutos. **A correção não depende disso**: a inbox e
+  a idempotência no banco cobrem reenvios fora da janela ou com outro id.
+
+### Mesmo caso de uso do HTTP
+
+O consumidor decodifica o envelope e chama `WagerService.HandleQueueMessage`,
+que usa o mesmo núcleo do HTTP (`submitInTx`). Numa **única transação SQL**:
+
+1. `INSERT` em `inbox_messages (consumer_name, message_id, payload_hash)` com
+   `ON CONFLICT DO NOTHING` (outro processo com a mesma mensagem: espera);
+2. se a inbox já concluiu essa mensagem: reentrega, nada é refeito
+   (mesmo `messageId` com outro hash: `ErrInboxConflict`, DLQ);
+3. processa a operação com a idempotência por `(providerId, data.idempotencyKey)`,
+   exatamente como no HTTP (o hash de negócio é o mesmo);
+4. marca a inbox como concluída;
+5. `COMMIT`. **Só então** o consumidor apaga a mensagem da fila.
+
+O hash da inbox é `sha256(hash de negócio | idempotencyKey)`. O
+`correlationId` dos eventos é o `messageId`.
+
+São duas camadas de deduplicação: a inbox (mesma mensagem) e a idempotência
+(mesma operação, em qualquer mensagem ou porta). Por isso a mesma operação
+enviada por HTTP e por SQS, em qualquer ordem ou ao mesmo tempo, gera um único
+débito.
+
+### Desfechos
+
+| Situação | Ação |
+|---|---|
+| processada, rejeição de negócio confirmada, ou duplicata (inbox/replay) | apaga a mensagem |
+| envelope inválido (JSON, campo desconhecido, valor como número, escala, UUID, `type` desconhecido, `occurredAt`) | DLQ imediata com `failure-reason`; nada é gravado |
+| validação de domínio (`OPENING`, `LOSS` ≠ 0.00, referência obrigatória...) | DLQ imediata |
+| provedor fora de `SQS_ALLOWED_PROVIDERS` | DLQ imediata (`forbidden`) |
+| conflito de idempotência ou de inbox | DLQ imediata |
+| falha transitória (banco, lock, timeout) ou erro desconhecido | `ChangeMessageVisibility` com backoff `min(1s × 2^(n−1), 60s)` (n = `ApproximateReceiveCount`); depois de 5 recebimentos, o **redrive** do SQS move para a DLQ |
+
+Mensagens para a DLQ levam o corpo original e os atributos `failure-reason` e
+`source-queue`; o envio usa o `MessageId` original como deduplicação. Se o
+envio para a DLQ falhar, a mensagem não é apagada (o redrive resolve).
+
+### Recebimento e parada
+
+- `SQS_POLLERS` goroutines (padrão 2) fazem long polling
+  (`WaitTimeSeconds` = `SQS_WAIT_TIME`, padrão 10s) com até 10 mensagens; cada
+  lote é tratado em ordem.
+- **SIGTERM:** o Fx chama `Stop`: os long polls são cancelados na hora, a
+  mensagem em andamento termina (prazo `SHUTDOWN_TIMEOUT`), as do lote que
+  ainda não começaram voltam com visibilidade 0. Se o prazo acabar, o
+  tratamento é cancelado (a transação é desfeita) e a mensagem é liberada.
+  O consumidor para antes do pool do banco fechar.
+- Se o processo morrer sem aviso, a mensagem reaparece depois do
+  `VisibilityTimeout` (30s) e é deduplicada pela inbox.
+
+### Controle de acesso
+
+- **Credenciais:** o consumidor usa a cadeia padrão da AWS (papel IAM da
+  tarefa em produção). `SQS_ACCESS_KEY_ID`/`SQS_SECRET_ACCESS_KEY` existem só
+  para o LocalStack.
+- **Política da fila** ([`wager-transactions-policy.json`](deploy/localstack/wager-transactions-policy.json)):
+  só os papéis dos provedores podem `SendMessage`; só o papel do serviço pode
+  receber, apagar e alterar visibilidade. É aplicada pelo script de
+  inicialização. **Limitação:** o LocalStack Community guarda a política mas
+  não a aplica (a aplicação de IAM é recurso pago); na AWS ela vale.
+- **Validações de domínio no consumidor**, independentes do broker: envelope
+  estrito, regras do domínio, e `SQS_ALLOWED_PROVIDERS` (lista de provedores
+  aceitos nesta fila). Uma mensagem não traz token: o provedor é o do corpo,
+  e a confiança vem da política da fila.
+
+### Testes (`test/integration/sqs_test.go`, LocalStack real)
+
+| Teste | Comprova |
+|---|---|
+| `ProcessesAndDeletesAfterCommit` | processa, conclui a inbox, apaga; readiness inclui `sqs` |
+| `DuplicatesAreDeduplicated` | mesmo `messageId` reenviado e outra mensagem com a mesma operação: 1 débito |
+| `SameOperationViaHTTPAndSQS` | HTTP→SQS, SQS→HTTP e simultâneo: 1 débito por operação |
+| `BusinessRejectionIsTerminal` | `INSUFFICIENT_FUNDS` persistido, mensagem apagada, DLQ vazia |
+| `InvalidMessagesGoToDLQ` | JSON quebrado, `LOSS` 1.00, `OPENING`, provedor desconhecido: DLQ com motivo, nada gravado |
+| `SameMessageIDWithDifferentContent` | conflito de inbox vai para a DLQ |
+| `CrashAfterCommitBeforeDelete` | **teste obrigatório 5**: queda depois do commit e antes de apagar; a reentrega é reconhecida pela inbox; 1 débito |
+| `TransientFailuresEndInDLQ` | backoff de visibilidade e redrive para a DLQ após `maxReceiveCount` |
+| `GracefulShutdown` | mensagem em andamento conclui no Stop; long poll ocioso para em < 1s |
+
+Cada teste cria filas próprias no LocalStack. A queda é simulada com um gancho
+(`Hooks.AfterCommit`) que faz o consumidor parar sem apagar nem alterar a
+visibilidade, como um processo derrubado nesse instante.

@@ -56,9 +56,26 @@ const maxTransientAttempts = 3
 
 // Submit valida e processa uma operação com idempotência persistente.
 func (s *WagerService) Submit(ctx context.Context, in SubmitInput) (SubmitResult, error) {
-	kind, err := wagering.ParseExternalKind(in.Kind)
+	kind, hash, err := prepare(in)
 	if err != nil {
 		return SubmitResult{}, err
+	}
+	var res SubmitResult
+	err = s.retryTransient(ctx, func() error {
+		return s.store.WithinTx(ctx, func(ctx context.Context, r Repositories) error {
+			var err error
+			res, err = s.submitInTx(ctx, r, in, kind, hash)
+			return err
+		})
+	})
+	return res, err
+}
+
+// prepare valida o tipo e calcula o hash do conteúdo de negócio.
+func prepare(in SubmitInput) (wagering.Kind, string, error) {
+	kind, err := wagering.ParseExternalKind(in.Kind)
+	if err != nil {
+		return "", "", err
 	}
 	hash, err := wagering.BusinessPayload{
 		ProviderID: in.ProviderID, ExternalTransactionID: in.ExternalTransactionID,
@@ -66,28 +83,35 @@ func (s *WagerService) Submit(ctx context.Context, in SubmitInput) (SubmitResult
 		Kind: kind, Money: in.Money, ReferenceExternalTransactionID: in.ReferenceExternalTransactionID,
 	}.Hash()
 	if err != nil {
-		return SubmitResult{}, domainerr.Field("money", "required")
+		return "", "", domainerr.Field("money", "required")
 	}
+	return kind, hash, nil
+}
 
+// retryTransient repete fn diante de ErrTransient, com espera crescente.
+func (s *WagerService) retryTransient(ctx context.Context, fn func() error) error {
 	var last error
 	for attempt := 0; attempt < maxTransientAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return SubmitResult{}, last
+				return last
 			case <-time.After(time.Duration(attempt*attempt) * 20 * time.Millisecond):
 			}
 		}
-		res, err := s.submitOnce(ctx, in, kind, hash)
+		err := fn()
 		if err == nil || !errors.Is(err, ErrTransient) {
-			return res, err
+			return err
 		}
 		last = err
 	}
-	return SubmitResult{}, last
+	return last
 }
 
-func (s *WagerService) submitOnce(ctx context.Context, in SubmitInput, kind wagering.Kind, hash string) (SubmitResult, error) {
+// submitInTx processa a operação dentro de uma transação SQL já aberta. É o
+// núcleo compartilhado por HTTP e SQS: o consumidor SQS chama esta função na
+// MESMA transação em que registra e conclui a mensagem na inbox.
+func (s *WagerService) submitInTx(ctx context.Context, r Repositories, in SubmitInput, kind wagering.Kind, hash string) (SubmitResult, error) {
 	txID, err := s.ids.NewID()
 	if err != nil {
 		return SubmitResult{}, err
@@ -112,7 +136,7 @@ func (s *WagerService) submitOnce(ctx context.Context, in SubmitInput, kind wage
 	}
 
 	var result SubmitResult
-	err = s.store.WithinTx(ctx, func(ctx context.Context, r Repositories) error {
+	err = func() error {
 		// 1. Idempotência: registra a operação. Se outra requisição com a
 		//    mesma chave estiver em andamento, o banco faz esta esperar.
 		inserted, err := r.Transactions().InsertIfAbsent(ctx, tx)
@@ -178,7 +202,7 @@ func (s *WagerService) submitOnce(ctx context.Context, in SubmitInput, kind wage
 		}
 		result = SubmitResult{Transaction: tx}
 		return nil
-	})
+	}()
 	return result, err
 }
 

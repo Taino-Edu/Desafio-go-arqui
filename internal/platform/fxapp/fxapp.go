@@ -15,8 +15,10 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
@@ -24,6 +26,7 @@ import (
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/auth"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/httpapi"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/postgres"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/sqsconsumer"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/config"
@@ -45,6 +48,7 @@ func New(cfg config.Config, extra ...fx.Option) fx.Option {
 		AppModule,
 		HTTPModule,
 		WorkersModule,
+		sqsModule(cfg),
 		fx.Options(extra...),
 	)
 }
@@ -119,9 +123,14 @@ var HTTPModule = fx.Module("http",
 				IdleTimeout: cfg.HTTP.IdleTimeout,
 			}
 		},
-		func(pool *pgxpool.Pool) *httpapi.Health {
-			return httpapi.NewHealth(2*time.Second, postgres.HealthChecker{Pool: pool})
-		},
+		fx.Annotate(
+			func(pool *pgxpool.Pool) httpapi.Checker { return postgres.HealthChecker{Pool: pool} },
+			fx.ResultTags(`group:"readiness"`),
+		),
+		fx.Annotate(
+			func(checkers []httpapi.Checker) *httpapi.Health { return httpapi.NewHealth(2*time.Second, checkers...) },
+			fx.ParamTags(`group:"readiness"`),
+		),
 		func(cfg config.Config) (httpapi.TokenVerifier, error) {
 			return auth.NewVerifier(auth.Config{
 				Issuer: cfg.Auth.Issuer, Audience: cfg.Auth.Audience, JWKSURL: cfg.Auth.JWKSURL,
@@ -162,4 +171,80 @@ func registerReferenceWorker(lc fx.Lifecycle, cfg config.Config, svc *app.WagerS
 		return true, nil
 	})
 	lc.Append(fx.Hook{OnStart: loop.Start, OnStop: loop.Stop})
+}
+
+// sqsModule: consumidor da fila de entrada (só quando SQS_ENABLED).
+func sqsModule(cfg config.Config) fx.Option {
+	if !cfg.SQS.Enabled {
+		return fx.Options()
+	}
+	return fx.Module("sqs",
+		fx.Provide(
+			func(lc fx.Lifecycle, cfg config.Config) (*sqs.Client, error) {
+				return sqsconsumer.NewClient(context.Background(), sqsconsumer.ClientConfig{
+					Region: cfg.SQS.Region, Endpoint: cfg.SQS.Endpoint,
+					AccessKeyID: cfg.SQS.AccessKeyID, SecretAccessKey: cfg.SQS.SecretAccessKey,
+				})
+			},
+			func() *sqsQueues { return &sqsQueues{} },
+			fx.Annotate(
+				func(c *sqs.Client, q *sqsQueues) httpapi.Checker {
+					return sqsconsumer.HealthChecker{Client: c, QueueURL: q.inputURL}
+				},
+				fx.ResultTags(`group:"readiness"`),
+			),
+		),
+		fx.Invoke(registerSQSConsumer),
+	)
+}
+
+// sqsQueues guarda as URLs resolvidas na partida.
+type sqsQueues struct {
+	mu         sync.RWMutex
+	input, dlq string
+}
+
+func (q *sqsQueues) inputURL() string {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.input
+}
+
+func registerSQSConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, queues *sqsQueues,
+	svc *app.WagerService, log *slog.Logger) {
+	var consumer *sqsconsumer.Consumer
+	lc.Append(fx.Hook{
+		// valida a dependência na partida: as filas precisam existir
+		OnStart: func(ctx context.Context) error {
+			input, err := sqsconsumer.ResolveQueueURL(ctx, client, cfg.SQS.InputQueue)
+			if err != nil {
+				return err
+			}
+			dlq, err := sqsconsumer.ResolveQueueURL(ctx, client, cfg.SQS.DLQ)
+			if err != nil {
+				return err
+			}
+			queues.mu.Lock()
+			queues.input, queues.dlq = input, dlq
+			queues.mu.Unlock()
+
+			allowed := map[string]bool{}
+			for _, p := range cfg.SQS.AllowedProviders {
+				allowed[p] = true
+			}
+			consumer = sqsconsumer.New(sqsconsumer.Config{
+				ConsumerName: cfg.SQS.ConsumerName, QueueURL: input, DLQURL: dlq,
+				Pollers: cfg.SQS.Pollers, MaxMessages: int32(cfg.SQS.MaxMessages), WaitTime: cfg.SQS.WaitTime,
+				ItemTimeout: cfg.HTTP.RequestTimeout, RetryBaseDelay: cfg.SQS.RetryBaseDelay,
+				RetryMaxDelay: cfg.SQS.RetryMaxDelay, AllowedProviders: allowed,
+			}, client, svc, log, sqsconsumer.Hooks{})
+			return consumer.Start(ctx)
+		},
+		OnStop: func(ctx context.Context) error {
+			if consumer == nil {
+				return nil
+			}
+			return consumer.Stop(ctx)
+		},
+	})
 }

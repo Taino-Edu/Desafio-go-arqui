@@ -21,6 +21,7 @@ type Config struct {
 	Database   Database
 	References References
 	Auth       Auth
+	SQS        SQS
 
 	StartTimeout    time.Duration // prazo para todas as dependências subirem
 	ShutdownTimeout time.Duration // prazo para concluir o trabalho em andamento
@@ -32,6 +33,24 @@ type HTTP struct {
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
 	IdleTimeout    time.Duration
+}
+
+// SQS configura o consumidor da fila de entrada.
+type SQS struct {
+	Enabled          bool
+	Region           string
+	Endpoint         string // vazio na AWS; http://localhost:4566 no LocalStack
+	AccessKeyID      string // opcional; vazio = cadeia padrão da AWS
+	SecretAccessKey  string
+	InputQueue       string // nome ou URL
+	DLQ              string // nome ou URL
+	ConsumerName     string // escopo da inbox
+	Pollers          int
+	MaxMessages      int
+	WaitTime         time.Duration // long polling (0..20s)
+	RetryBaseDelay   time.Duration // backoff da visibilidade em falha transitória
+	RetryMaxDelay    time.Duration
+	AllowedProviders []string // vazio = qualquer provedor
 }
 
 // Auth descreve o IdP OAuth 2.0/OIDC. Não há modo "sem autenticação".
@@ -89,6 +108,22 @@ func Load(getenv func(string) string) (Config, error) {
 			MaxDelay:      r.dur("REFERENCE_RETRY_MAX_DELAY", 5*time.Minute),
 			MaxAttempts:   r.int("REFERENCE_RETRY_MAX_ATTEMPTS", 12),
 		},
+		SQS: SQS{
+			Enabled:          r.bool("SQS_ENABLED", true),
+			Region:           r.str("AWS_REGION", "us-east-1"),
+			Endpoint:         r.str("SQS_ENDPOINT", ""),
+			AccessKeyID:      r.str("SQS_ACCESS_KEY_ID", ""),
+			SecretAccessKey:  r.str("SQS_SECRET_ACCESS_KEY", ""),
+			InputQueue:       r.str("SQS_INPUT_QUEUE", "wager-transactions.fifo"),
+			DLQ:              r.str("SQS_INPUT_DLQ", "wager-transactions-dlq.fifo"),
+			ConsumerName:     r.str("SQS_CONSUMER_NAME", "wager-transactions-consumer"),
+			Pollers:          r.int("SQS_POLLERS", 2),
+			MaxMessages:      r.int("SQS_MAX_MESSAGES", 10),
+			WaitTime:         r.dur("SQS_WAIT_TIME", 10*time.Second),
+			RetryBaseDelay:   r.dur("SQS_RETRY_BASE_DELAY", time.Second),
+			RetryMaxDelay:    r.dur("SQS_RETRY_MAX_DELAY", time.Minute),
+			AllowedProviders: r.list("SQS_ALLOWED_PROVIDERS"),
+		},
 		Auth: Auth{
 			Issuer:   r.str("OIDC_ISSUER", ""),
 			Audience: r.str("OIDC_AUDIENCE", "wallet-api"),
@@ -140,6 +175,20 @@ func (c Config) Validate() error {
 	if c.References.MaxAttempts < 1 {
 		errs = append(errs, errors.New("REFERENCE_RETRY_MAX_ATTEMPTS must be >= 1"))
 	}
+	if c.SQS.Enabled {
+		if c.SQS.InputQueue == "" || c.SQS.DLQ == "" || c.SQS.ConsumerName == "" {
+			errs = append(errs, errors.New("SQS_INPUT_QUEUE, SQS_INPUT_DLQ and SQS_CONSUMER_NAME are required when SQS_ENABLED"))
+		}
+		if c.SQS.Pollers < 1 || c.SQS.MaxMessages < 1 || c.SQS.MaxMessages > 10 {
+			errs = append(errs, errors.New("SQS_POLLERS must be >= 1 and SQS_MAX_MESSAGES between 1 and 10"))
+		}
+		if c.SQS.WaitTime < 0 || c.SQS.WaitTime > 20*time.Second {
+			errs = append(errs, errors.New("SQS_WAIT_TIME must be between 0s and 20s"))
+		}
+		if c.SQS.RetryBaseDelay < time.Second || c.SQS.RetryMaxDelay < c.SQS.RetryBaseDelay || c.SQS.RetryMaxDelay > 12*time.Hour {
+			errs = append(errs, errors.New("SQS_RETRY_BASE_DELAY must be >= 1s and <= SQS_RETRY_MAX_DELAY <= 12h"))
+		}
+	}
 	if c.Database.LockTimeout >= c.HTTP.RequestTimeout {
 		errs = append(errs, errors.New("DB_LOCK_TIMEOUT must be shorter than HTTP_REQUEST_TIMEOUT"))
 	}
@@ -180,6 +229,16 @@ func (r *reader) int(key string, def int) int {
 		r.errs = append(r.errs, fmt.Errorf("%s: invalid integer %q", key, v))
 	}
 	return n
+}
+
+func (r *reader) list(key string) []string {
+	var out []string
+	for _, v := range strings.Split(r.get(key), ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (r *reader) bool(key string, def bool) bool {

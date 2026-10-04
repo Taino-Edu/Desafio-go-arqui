@@ -37,6 +37,7 @@ func Config(dbURL string) config.Config {
 		Database: config.Database{
 			URL: dbURL, MaxConns: 30, StatementTimeout: 5 * time.Second, LockTimeout: 3 * time.Second,
 		},
+		SQS: config.SQS{Enabled: false},
 		References: config.References{
 			WorkerEnabled: true, PollInterval: 50 * time.Millisecond,
 			BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second, MaxAttempts: 5,

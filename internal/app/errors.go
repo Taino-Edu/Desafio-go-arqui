@@ -20,6 +20,9 @@ var (
 	// outra chave de idempotência; a operação não é reaplicada.
 	ErrDuplicateTransaction = errors.New("external transaction already registered with another idempotency key")
 
+	// ErrInboxConflict: o mesmo messageId chegou com outro conteúdo.
+	ErrInboxConflict = errors.New("message id redelivered with a different payload")
+
 	// ErrInvalidCursor: o cursor de paginação não foi gerado por este serviço.
 	ErrInvalidCursor = errors.New("invalid pagination cursor")
 

@@ -83,7 +83,7 @@ func startInstances(t *testing.T, db *pgtest.DB, n int) []*instance {
 			fmt.Sprintf("HTTP_ADDR=127.0.0.1:%d", port),
 			fmt.Sprintf("INSTANCE_ID=instance-%d", i+1),
 			"DB_MAX_CONNS=10", "LOG_LEVEL=warn",
-			"OIDC_ISSUER="+idptest.Issuer(), "OIDC_AUDIENCE=wallet-api",
+			"OIDC_ISSUER="+idptest.Issuer(), "OIDC_AUDIENCE=wallet-api", "SQS_ENABLED=false",
 		)
 		cmd.Stdout, cmd.Stderr = logs, logs
 		if err := cmd.Start(); err != nil {
