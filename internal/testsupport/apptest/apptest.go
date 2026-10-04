@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,10 @@ func Config(dbURL string) config.Config {
 		Database: config.Database{
 			URL: dbURL, MaxConns: 30, StatementTimeout: 5 * time.Second, LockTimeout: 3 * time.Second,
 		},
+		References: config.References{
+			WorkerEnabled: true, PollInterval: 50 * time.Millisecond,
+			BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second, MaxAttempts: 5,
+		},
 		StartTimeout: 10 * time.Second, ShutdownTimeout: 10 * time.Second,
 	}
 }
@@ -52,12 +57,26 @@ type App struct {
 // Start cria um banco descartável, sobe a aplicação e registra o shutdown.
 func Start(t *testing.T) *App {
 	t.Helper()
-	db := pgtest.New(t)
+	a, _ := StartOn(t, pgtest.New(t), nil)
+	return a
+}
+
+// StartOn sobe uma instância da aplicação sobre um banco existente, com a
+// configuração ajustada por mutate. Devolve também uma função para parar a
+// instância antes do fim do teste (simula reinício ou queda de instância).
+func StartOn(t *testing.T, db *pgtest.DB, mutate func(*config.Config)) (*App, func()) {
+	t.Helper()
+	cfg := Config(db.AppURL)
+	if mutate != nil {
+		mutate(&cfg)
+	}
 	var srv *httpapi.Server
-	app := fxtest.New(t, fxapp.New(Config(db.AppURL), QuietLogger, fx.Populate(&srv)))
+	app := fxtest.New(t, fxapp.New(cfg, QuietLogger, fx.Populate(&srv)))
 	app.RequireStart()
-	t.Cleanup(app.RequireStop)
-	return &App{DB: db, Client: NewClient(t, "http://"+srv.Addr())}
+	var once sync.Once
+	stop := func() { once.Do(app.RequireStop) }
+	t.Cleanup(stop)
+	return &App{DB: db, Client: NewClient(t, "http://"+srv.Addr())}, stop
 }
 
 // Client é um cliente HTTP mínimo para os testes.
@@ -211,5 +230,22 @@ func Must(t testing.TB, r Response, status int, what string) Response {
 	if r.Status != status {
 		t.Fatalf("%s: status %d, want %d; body %v", what, r.Status, status, r.Body)
 	}
+	return r
+}
+
+// WaitStatus consulta a operação até ela chegar ao status esperado ou o
+// prazo acabar. Devolve a última resposta.
+func (c *Client) WaitStatus(providerID, externalID, status string, timeout time.Duration) Response {
+	c.t.Helper()
+	deadline := time.Now().Add(timeout)
+	var r Response
+	for time.Now().Before(deadline) {
+		r = c.Do("GET", "/providers/"+providerID+"/wagering/transactions/"+externalID, nil)
+		if r.Str("status") == status {
+			return r
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("%s/%s não chegou a %s em %v; último: %d %v", providerID, externalID, status, timeout, r.Status, r.Body)
 	return r
 }

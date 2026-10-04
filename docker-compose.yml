@@ -100,6 +100,7 @@ services:
       DATABASE_URL: postgres://wallet_app:wallet_app@postgres:5432/wallet?sslmode=disable
       LOG_LEVEL: info
       SHUTDOWN_TIMEOUT: 25s
+      REFERENCE_WORKER_ENABLED: "true"
     ports:
       - "${APP_PORT:-8080}:8080"
     # o compose espera até 30s pelo shutdown gracioso antes de matar

@@ -66,6 +66,14 @@ type TransactionRepository interface {
 	// HasProcessedReversal informa se a transação já tem REFUND ou ROLLBACK
 	// concluído apontando para ela.
 	HasProcessedReversal(ctx context.Context, referenceID uuid.UUID) (bool, error)
+	// ClaimDuePendingReference trava e devolve UMA operação em
+	// PENDING_REFERENCE cuja próxima tentativa já venceu, pulando as que
+	// outra instância já travou (SKIP LOCKED). nil se não houver nenhuma.
+	ClaimDuePendingReference(ctx context.Context, now time.Time) (*wagering.WagerTransaction, error)
+	// NudgePendingReferences antecipa para agora a próxima tentativa das
+	// pendências que esperam (providerID, externalID). Não espera por linhas
+	// travadas por outra transação (SKIP LOCKED), então não causa deadlock.
+	NudgePendingReferences(ctx context.Context, providerID, externalID string, now time.Time) error
 }
 
 // LedgerRepository persiste e lê lançamentos (append-only).

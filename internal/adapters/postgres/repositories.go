@@ -394,3 +394,29 @@ func deref(s *string) string {
 	}
 	return *s
 }
+
+// ClaimDuePendingReference: FOR UPDATE SKIP LOCKED faz cada instância pegar
+// uma pendência diferente, sem esperar pelas que outra já está processando.
+func (r transactionRepo) ClaimDuePendingReference(ctx context.Context, now time.Time) (*wagering.WagerTransaction, error) {
+	t, err := scanTransaction(r.q.QueryRow(ctx, `SELECT `+txColumns+`
+		  FROM wager_transactions
+		 WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= $1
+		 ORDER BY next_attempt_at
+		 LIMIT 1
+		 FOR UPDATE SKIP LOCKED`, now))
+	if errors.Is(err, app.ErrTransactionNotFound) {
+		return nil, nil
+	}
+	return t, err
+}
+
+func (r transactionRepo) NudgePendingReferences(ctx context.Context, providerID, externalID string, now time.Time) error {
+	_, err := r.q.Exec(ctx, `
+		UPDATE wager_transactions SET next_attempt_at = $3, updated_at = GREATEST(updated_at, $3)
+		 WHERE id IN (
+			SELECT id FROM wager_transactions
+			 WHERE provider_id = $1 AND reference_external_transaction_id = $2
+			   AND status = 'PENDING_REFERENCE' AND next_attempt_at > $3
+			 FOR UPDATE SKIP LOCKED)`, providerID, externalID, now)
+	return classify(err)
+}

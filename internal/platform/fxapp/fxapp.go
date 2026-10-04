@@ -26,6 +26,7 @@ import (
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/config"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/worker"
 )
 
 // New devolve todas as opções do Fx para uma configuração já validada.
@@ -42,6 +43,7 @@ func New(cfg config.Config, extra ...fx.Option) fx.Option {
 		PostgresModule,
 		AppModule,
 		HTTPModule,
+		WorkersModule,
 		fx.Options(extra...),
 	)
 }
@@ -95,9 +97,14 @@ var AppModule = fx.Module("app",
 		func() app.Clock { return app.SystemClock{} },
 		func() app.IDGenerator { return app.UUIDv7{} },
 		app.NewWalletService,
-		func(store app.Store, clock app.Clock, ids app.IDGenerator) *app.WagerService {
-			return app.NewWagerService(store, clock, ids, wagering.DefaultReferenceRetryPolicy)
+		func(cfg config.Config) (wagering.ReferenceRetryPolicy, error) {
+			p := wagering.ReferenceRetryPolicy{
+				BaseDelay: cfg.References.BaseDelay, MaxDelay: cfg.References.MaxDelay,
+				MaxAttempts: cfg.References.MaxAttempts,
+			}
+			return p, p.Validate()
 		},
+		app.NewWagerService,
 	),
 )
 
@@ -121,3 +128,32 @@ var HTTPModule = fx.Module("http",
 		lc.Append(fx.Hook{OnStart: s.Start, OnStop: s.Stop})
 	}),
 )
+
+// WorkersModule: trabalho em segundo plano. Os workers dependem do Store
+// (e portanto do pool), então o Fx os para ANTES de fechar o pool.
+var WorkersModule = fx.Module("workers",
+	fx.Invoke(registerReferenceWorker),
+)
+
+func registerReferenceWorker(lc fx.Lifecycle, cfg config.Config, svc *app.WagerService, log *slog.Logger) {
+	if !cfg.References.WorkerEnabled {
+		log.Info("reference worker disabled")
+		return
+	}
+	loop := worker.New(worker.Config{
+		Name:        "pending-references",
+		Interval:    cfg.References.PollInterval,
+		ItemTimeout: cfg.HTTP.RequestTimeout,
+	}, log, func(ctx context.Context) (bool, error) {
+		res, err := svc.ResolveNextPending(ctx)
+		if err != nil || !res.Found {
+			return false, err
+		}
+		tx := res.Transaction
+		log.Info("pending reference processed",
+			"transactionId", tx.ID(), "walletId", tx.WalletID(), "providerId", tx.External().ProviderID,
+			"outcome", res.Outcome, "status", tx.Status(), "failureCode", tx.FailureCode(), "attempts", tx.Attempts())
+		return true, nil
+	})
+	lc.Append(fx.Hook{OnStart: loop.Start, OnStop: loop.Stop})
+}

@@ -21,6 +21,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.HTTP.Addr != ":8080" || cfg.Database.MaxConns != 20 || cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("defaults = %+v", cfg)
 	}
+	if !cfg.References.WorkerEnabled || cfg.References.MaxAttempts != 12 {
+		t.Errorf("references = %+v", cfg.References)
+	}
 	if cfg.HTTP.RequestTimeout >= cfg.ShutdownTimeout {
 		t.Error("o padrão deve permitir concluir requisições no shutdown")
 	}
@@ -53,6 +56,9 @@ func TestLoad_Invalid(t *testing.T) {
 		"timeout negativo":     {map[string]string{"DATABASE_URL": "x", "HTTP_IDLE_TIMEOUT": "-1s"}, "HTTP_IDLE_TIMEOUT must be positive"},
 		"requisição > desliga": {map[string]string{"DATABASE_URL": "x", "HTTP_REQUEST_TIMEOUT": "30s", "SHUTDOWN_TIMEOUT": "10s"}, "shorter than SHUTDOWN_TIMEOUT"},
 		"lock > requisição":    {map[string]string{"DATABASE_URL": "x", "DB_LOCK_TIMEOUT": "20s"}, "DB_LOCK_TIMEOUT must be shorter"},
+		"booleano inválido":    {map[string]string{"DATABASE_URL": "x", "REFERENCE_WORKER_ENABLED": "talvez"}, "invalid boolean"},
+		"teto < base":          {map[string]string{"DATABASE_URL": "x", "REFERENCE_RETRY_MAX_DELAY": "100ms"}, "REFERENCE_RETRY_MAX_DELAY must be"},
+		"tentativas zero":      {map[string]string{"DATABASE_URL": "x", "REFERENCE_RETRY_MAX_ATTEMPTS": "0"}, "REFERENCE_RETRY_MAX_ATTEMPTS must be"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

@@ -14,11 +14,11 @@ correspondente é implementada (ver o roteiro em
 | [Contrato HTTP](#contrato-http) | ✅ (reconciliação na fase 10) |
 | [Idempotência](#idempotência) | ✅ HTTP; SQS reutiliza o mesmo caso de uso na fase 8 |
 | [Concorrência e locks](#concorrência-e-locks) | ✅ |
-| Reversões e referências pendentes | 🟡 reversões e registro de `PENDING_REFERENCE` prontos; worker na fase 6 |
+| [Referências pendentes e worker](#referências-pendentes-e-worker) | ✅ |
 | Autenticação e autorização | 🟡 Keycloak provisionado na fase 3; validação na fase 7 |
 | Inbox, SQS e DLQ | ⏳ fase 8 |
 | Outbox | ⏳ fase 9 |
-| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP e banco; workers entram nas fases 6, 8 e 9 |
+| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco e worker de referências; SQS e outbox nas fases 8 e 9 |
 | Observabilidade | ⏳ fase 10 |
 
 ---
@@ -393,6 +393,7 @@ Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
 | `postgres` | `*pgxpool.Pool`, `app.Store` | OnStart: ping (sem banco, não sobe). OnStop: fecha o pool |
 | `app` | `Clock`, `IDGenerator`, `WalletService` | — |
 | `http` | `Health`, handler, `*httpapi.Server` | `fx.Invoke` registra OnStart (abre a porta) e OnStop (shutdown gracioso) |
+| `workers` | — | `fx.Invoke` registra o loop do worker de referências: OnStart inicia a goroutine; OnStop para de buscar trabalho, espera o item em andamento e, se o prazo acabar, cancela o item (a transação é desfeita) |
 
 - **Partida:** `cmd/server` valida a configuração antes do Fx (inválida → sai
   com código 2). O Fx executa os OnStart em ordem: banco, depois HTTP; cada um
@@ -402,7 +403,9 @@ Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
   1. HTTP: o readiness passa a `503 draining`, o servidor para de aceitar
      conexões e espera as requisições em andamento (`http.Server.Shutdown`);
      se o prazo estourar, fecha as conexões restantes.
-  2. Banco: o pool fecha **depois** que ninguém mais o usa.
+  2. Worker: para de pegar pendências e conclui (ou desfaz) a atual.
+  3. Banco: o pool fecha **depois** que ninguém mais o usa (HTTP e worker
+     dependem do `Store`, então o Fx os para antes).
 - `HTTP_REQUEST_TIMEOUT < SHUTDOWN_TIMEOUT` é validado na configuração, para
   que uma requisição em andamento sempre caiba no prazo de desligamento.
 - `docker-compose` usa `stop_grace_period: 30s` (maior que `SHUTDOWN_TIMEOUT`).
@@ -570,3 +573,86 @@ saldo negativo, mas o perdedor recebe `500` em vez de uma rejeição limpa.
 Todos terminam com a reconciliação de todas as carteiras (saldo = créditos −
 débitos do ledger) e rodam com `-race`. Foram repetidos 5 vezes seguidas sem
 falha.
+
+---
+
+## Referências pendentes e worker
+
+Arquivos: [`app/references.go`](internal/app/references.go),
+[`worker/loop.go`](internal/worker/loop.go),
+[`postgres/repositories.go`](internal/adapters/postgres/repositories.go).
+
+### Fluxo
+
+1. Uma operação com referência (`REFUND`, `ROLLBACK`, `WIN` com referência)
+   chega antes da referência: é gravada como `PENDING_REFERENCE` com
+   `next_attempt_at = agora + 1s`, o evento `WagerTransactionPendingReference`
+   vai para a outbox, e o HTTP responde `202`. A pendência é **durável**: está
+   no banco, não na memória de nenhuma instância.
+2. Quando a referência é concluída (`BET`, `WIN` ou `REFUND` processado), a
+   mesma transação SQL antecipa para "agora" o `next_attempt_at` das
+   pendências que esperam por ela (`NudgePendingReferences`, com
+   `SKIP LOCKED`, sem esperar por linhas travadas). Resultado medido nos
+   testes: a pendência é resolvida cerca de 50 ms depois da chegada da
+   referência, em vez de esperar o próximo ciclo do backoff.
+3. O worker de cada instância roda `ResolveNextPending` em loop. Cada rodada é
+   uma transação:
+   - `SELECT ... WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= agora
+     ORDER BY next_attempt_at LIMIT 1 FOR UPDATE SKIP LOCKED`;
+   - trava a carteira, busca a referência e aplica **as mesmas funções do
+     envio** (`evaluate` e `persist`): mesmas regras, mesma gravação de saldo,
+     ledger, estado e outbox;
+   - referência ainda indisponível: `attempts + 1` e reagenda com
+     `min(1s × 2^n, 5min)` + até 20% de jitter; ao chegar em
+     `REFERENCE_RETRY_MAX_ATTEMPTS` (padrão 12, cerca de 24 min), rejeita com
+     `REFERENCE_NOT_FOUND` e emite `WagerTransactionRejected`.
+
+### Comportamento por estado da referência
+
+| Referência | Desfecho da pendência |
+|---|---|
+| não existe ainda | reagenda (ou `REFERENCE_NOT_FOUND` ao esgotar) |
+| existe, `PENDING_REFERENCE` (ela também espera algo) | reagenda (ou `REFERENCE_NOT_FOUND` ao esgotar) |
+| `PROCESSED` | aplica a operação |
+| `REJECTED` ou `FAILED` | `REJECTED` com `REFERENCE_NOT_PROCESSED` (sem esperar a expiração) |
+| já revertida por outra operação | `REJECTED` com `ALREADY_REVERSED` |
+| divergente (provedor, jogador, carteira, moeda, rodada, valor, tipo) | `REJECTED` com o código correspondente |
+
+### Concorrência e recuperação
+
+- **Várias instâncias:** `FOR UPDATE SKIP LOCKED` faz cada worker pegar uma
+  pendência diferente, sem esperar pelas que outro já está processando.
+- **Exatamente uma vez:** garantido pelo banco, não pelo lock de seleção.
+  Experimento registrado: removendo o `FOR UPDATE SKIP LOCKED`, o teste de 3
+  workers continua passando, porque o segundo worker a tentar gravar uma
+  pendência já concluída é barrado pelo trigger da máquina de estados (estado
+  terminal não muda) e a transação dele é desfeita. O `SKIP LOCKED` evita esse
+  trabalho desperdiçado.
+- **Ordem dos locks sem ciclo:** o worker trava a pendência e depois a
+  carteira; o envio trava a própria operação e a carteira e só "cutuca"
+  pendências com `SKIP LOCKED` (não espera). Nenhum caminho espera por uma
+  pendência segurando uma carteira.
+- **Queda no meio:** a transação é desfeita e a pendência continua vencida;
+  outra instância (ou a mesma, ao voltar) a pega.
+- **Aceite assíncrono:** operações sem dependência não têm commit intermediário
+  de `PENDING` (vão direto ao desfecho). O único estado intermediário
+  confirmado é `PENDING_REFERENCE`, retomável por qualquer instância.
+
+### Loop de worker (`internal/worker`)
+
+Genérico (será reutilizado pelo consumidor SQS e pelo publicador da outbox):
+chama o trabalho de novo na hora enquanto houver itens, espera
+`REFERENCE_WORKER_INTERVAL` (com jitter) quando não há, e aplica backoff
+exponencial (até 30s) em erros seguidos, para não martelar um banco fora do
+ar. O contexto do item não deriva do contexto de partida do Fx; só é
+cancelado se o prazo de parada acabar. `Done()` permite observar o término.
+
+### Testes (`test/integration/references_test.go`)
+
+| Teste | Comprova |
+|---|---|
+| `ResolvedWhenReferenceArrives` | REFUND antes da BET; ao chegar a BET, o REFUND é concluído, saldo restaurado, replay devolve o resultado final |
+| `ExpiresAsReferenceNotFound` | sem referência, após 3 tentativas: `REJECTED`/`REFERENCE_NOT_FOUND`, evento de rejeição |
+| `ReferenceRejected` | referência rejeitada: `REFERENCE_NOT_PROCESSED` |
+| `ResumedAfterRestart` | instância sem worker registra a pendência e cai; uma instância nova retoma do banco |
+| `CompetingWorkers` | 30 pendências e 3 instâncias com worker ao mesmo tempo: cada REFUND creditado exatamente uma vez |

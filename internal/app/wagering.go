@@ -9,7 +9,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/domainerr"
-	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/events"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/money"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wallet"
@@ -153,37 +152,29 @@ func (s *WagerService) submitOnce(ctx context.Context, in SubmitInput, kind wage
 		}
 
 		// 4. Regras de negócio.
-		entry, err := s.decide(ctx, r, tx, w, ref, entryID, now)
+		entry, awaiting, err := s.evaluate(ctx, r, tx, w, ref, entryID, now)
 		if err != nil {
 			return err
 		}
-
-		// 5. Persiste tudo no mesmo commit: estado, saldo, ledger, eventos.
-		if err := r.Transactions().Update(ctx, tx); err != nil {
-			return err
-		}
-		var evs []events.Event
-		evs = append(evs, tx.PullEvents()...)
-		if w != nil {
-			if movedEvents := w.PullEvents(); len(movedEvents) > 0 {
-				if err := r.Wallets().Update(ctx, w); err != nil {
-					return err
-				}
-				evs = append(evs, movedEvents...)
-			}
-		}
-		if entry != nil {
-			if err := r.Ledger().Insert(ctx, *entry); err != nil {
+		if awaiting {
+			// a referência ainda não chegou: fica durável como
+			// PENDING_REFERENCE e o worker de referências assume daqui
+			if err := tx.MarkPendingReference(now.Add(s.refPolicy.Delay(0)), now); err != nil {
 				return err
 			}
 		}
-		id := tx.ID()
-		records, err := toOutboxRecords(ctx, s.ids, &id, evs...)
-		if err != nil {
+
+		// 5. Persiste tudo no mesmo commit: estado, saldo, ledger, eventos.
+		if err := s.persist(ctx, r, tx, w, entry); err != nil {
 			return err
 		}
-		if err := r.Outbox().Append(ctx, records...); err != nil {
-			return err
+
+		// 6. Se esta operação pode ser referência de outra (BET, WIN, REFUND)
+		//    e foi concluída, antecipa as pendências que esperam por ela.
+		if tx.Status() == wagering.StatusProcessed && tx.Kind() != wagering.KindLoss && tx.Kind() != wagering.KindRollback {
+			if err := r.Transactions().NudgePendingReferences(ctx, in.ProviderID, in.ExternalTransactionID, now); err != nil {
+				return err
+			}
 		}
 		result = SubmitResult{Transaction: tx}
 		return nil
@@ -191,10 +182,13 @@ func (s *WagerService) submitOnce(ctx context.Context, in SubmitInput, kind wage
 	return result, err
 }
 
-// decide aplica as regras sobre a transação recém-registrada e devolve o
-// lançamento a gravar (nil se não houver movimentação).
-func (s *WagerService) decide(ctx context.Context, r Repositories, tx *wagering.WagerTransaction,
-	w *wallet.Wallet, ref *wagering.WagerTransaction, entryID uuid.UUID, now time.Time) (*wallet.LedgerEntry, error) {
+// evaluate aplica as regras de negócio à transação (PENDING ou
+// PENDING_REFERENCE) com a carteira já travada. Devolve o lançamento a
+// gravar (nil se não houver movimentação) e awaiting=true quando a referência
+// ainda não está disponível; nesse caso a transação NÃO muda de estado e quem
+// chama decide entre registrar a pendência, reagendar ou expirar.
+func (s *WagerService) evaluate(ctx context.Context, r Repositories, tx *wagering.WagerTransaction,
+	w *wallet.Wallet, ref *wagering.WagerTransaction, entryID uuid.UUID, now time.Time) (entry *wallet.LedgerEntry, awaiting bool, err error) {
 
 	// Uma referência recebe no máximo uma reversão bem-sucedida. A consulta é
 	// segura porque a carteira (da operação e da referência) está travada; o
@@ -203,10 +197,10 @@ func (s *WagerService) decide(ctx context.Context, r Repositories, tx *wagering.
 		ref.WalletID() == tx.WalletID() {
 		done, err := r.Transactions().HasProcessedReversal(ctx, ref.ID())
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if done {
-			return nil, tx.MarkRejected(wagering.FailureAlreadyReversed, now)
+			return nil, false, tx.MarkRejected(wagering.FailureAlreadyReversed, now)
 		}
 	}
 
@@ -214,15 +208,39 @@ func (s *WagerService) decide(ctx context.Context, r Repositories, tx *wagering.
 		Transaction: tx, Wallet: w, Reference: ref, LedgerEntryID: entryID, Now: now,
 	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if out.Result == wagering.ResultAwaitingReference {
-		// a referência ainda não chegou: fica durável como PENDING_REFERENCE
-		// e o worker de referências assume a continuidade
-		next := now.Add(s.refPolicy.Delay(0))
-		return nil, tx.MarkPendingReference(next, now)
+	return out.Entry, out.Result == wagering.ResultAwaitingReference, nil
+}
+
+// persist grava, na transação SQL corrente, o novo estado da operação, o
+// saldo e o lançamento (se houve movimentação) e os eventos na outbox.
+func (s *WagerService) persist(ctx context.Context, r Repositories, tx *wagering.WagerTransaction,
+	w *wallet.Wallet, entry *wallet.LedgerEntry) error {
+
+	if err := r.Transactions().Update(ctx, tx); err != nil {
+		return err
 	}
-	return out.Entry, nil
+	evs := tx.PullEvents()
+	if w != nil {
+		if moved := w.PullEvents(); len(moved) > 0 {
+			if err := r.Wallets().Update(ctx, w); err != nil {
+				return err
+			}
+			evs = append(evs, moved...)
+		}
+	}
+	if entry != nil {
+		if err := r.Ledger().Insert(ctx, *entry); err != nil {
+			return err
+		}
+	}
+	id := tx.ID()
+	records, err := toOutboxRecords(ctx, s.ids, &id, evs...)
+	if err != nil {
+		return err
+	}
+	return r.Outbox().Append(ctx, records...)
 }
 
 // matchExisting decide o que fazer quando a chave ou o id externo já existem:

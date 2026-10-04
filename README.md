@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **5 — operações com idempotência e concorrência**.
+> 🚧 Em construção. Fase atual: **6 — worker de referências pendentes**.
 >
 > ⚠️ Autenticação ainda não está ligada nos endpoints (fase 7).
 
@@ -85,6 +85,10 @@ DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=dis
 | `DB_STATEMENT_TIMEOUT` / `DB_LOCK_TIMEOUT` | `5s` / `3s` | limites por comando e por espera de lock |
 | `HTTP_REQUEST_TIMEOUT` | `10s` | prazo de cada requisição |
 | `START_TIMEOUT` / `SHUTDOWN_TIMEOUT` | `30s` / `25s` | prazos de partida e de desligamento gracioso |
+| `REFERENCE_WORKER_ENABLED` | `true` | liga o worker de referências pendentes nesta instância |
+| `REFERENCE_WORKER_INTERVAL` | `1s` | espera do worker quando não há pendência vencida |
+| `REFERENCE_RETRY_BASE_DELAY` / `REFERENCE_RETRY_MAX_DELAY` | `1s` / `5m` | backoff exponencial entre tentativas |
+| `REFERENCE_RETRY_MAX_ATTEMPTS` | `12` | depois disso: `REJECTED` com `REFERENCE_NOT_FOUND` |
 
 Obter um token de teste (fluxo `client_credentials`):
 
@@ -126,6 +130,9 @@ go test -tags=integration -race ./...
 # só os testes de concorrência e de 3 instâncias (compila cmd/server e sobe 3 processos)
 go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeIndependentInstances' ./test/integration/
 
+# referências pendentes: chegada fora de ordem, expiração, reinício, workers concorrentes
+go test -tags=integration -race -run 'PendingReference' ./test/integration/
+
 # fuzzing do parser de dinheiro (opcional)
 go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ```
@@ -146,6 +153,7 @@ internal/adapters/postgres/  repositórios pgx, transação (Store), migrations
 internal/adapters/httpapi/   rotas, middlewares, erros, health
 internal/platform/config/    configuração por variáveis de ambiente
 internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
+internal/worker/             loop genérico de trabalho em segundo plano (parada observável)
 internal/testsupport/pgtest/ banco descartável para testes de integração
 internal/testsupport/apptest/ aplicação completa + cliente HTTP para testes de ponta a ponta
 test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias
