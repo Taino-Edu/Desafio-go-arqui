@@ -15,7 +15,7 @@ correspondente é implementada (ver o roteiro em
 | [Idempotência](#idempotência) | ✅ HTTP; SQS reutiliza o mesmo caso de uso na fase 8 |
 | [Concorrência e locks](#concorrência-e-locks) | ✅ |
 | [Referências pendentes e worker](#referências-pendentes-e-worker) | ✅ |
-| Autenticação e autorização | 🟡 Keycloak provisionado na fase 3; validação na fase 7 |
+| [Autenticação e autorização](#autenticação-e-autorização) | ✅ HTTP; SQS (credenciais e políticas do broker) na fase 8 |
 | Inbox, SQS e DLQ | ⏳ fase 8 |
 | Outbox | ⏳ fase 9 |
 | [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco e worker de referências; SQS e outbox nas fases 8 e 9 |
@@ -470,7 +470,13 @@ indisponibilidade transitória (`503`).
 - **Instantes:** UTC, truncados em microssegundos (a precisão do Postgres), para
   que o valor devolvido na criação seja igual ao lido depois.
 
-> Autenticação ainda não está ligada: entra na fase 7, antes da entrega.
+Rotas de negócio exigem `Authorization: Bearer <token>`; veja
+[Autenticação e autorização](#autenticação-e-autorização).
+
+| Situação | Status | `error.code` |
+|---|---|---|
+| token ausente, inválido, expirado, de outro emissor ou de outra audiência | `401` + `WWW-Authenticate: Bearer` | `UNAUTHENTICATED` |
+| identidade válida sem permissão (ex.: provedor agindo por outro) | `403` | `FORBIDDEN` |
 
 ---
 
@@ -656,3 +662,97 @@ cancelado se o prazo de parada acabar. `Done()` permite observar o término.
 | `ReferenceRejected` | referência rejeitada: `REFERENCE_NOT_PROCESSED` |
 | `ResumedAfterRestart` | instância sem worker registra a pendência e cai; uma instância nova retoma do banco |
 | `CompetingWorkers` | 30 pendências e 3 instâncias com worker ao mesmo tempo: cada REFUND creditado exatamente uma vez |
+
+---
+
+## Autenticação e autorização
+
+Arquivos: [`adapters/auth/oidc.go`](internal/adapters/auth/oidc.go),
+[`app/authz.go`](internal/app/authz.go),
+[`httpapi/auth.go`](internal/adapters/httpapi/auth.go),
+[`deploy/keycloak/realm-wallet.json`](deploy/keycloak/realm-wallet.json).
+
+### Escolha do IdP
+
+**Keycloak** (OAuth 2.0/OIDC), provisionado automaticamente pelo docker compose
+com o realm `wallet` importado. Motivos: é o recomendado pelo desafio, roda
+localmente sem conta externa, suporta `client_credentials` (comunicação entre
+serviços, sem usuário humano), papéis de realm e claims fixas por cliente. O
+serviço **não** emite tokens nem guarda senhas.
+
+### Fluxo
+
+1. O provedor (ou o serviço interno) obtém um access token no Keycloak com
+   `client_credentials` (`client_id` + `client_secret`).
+2. Envia `Authorization: Bearer <token>` em toda rota de negócio.
+3. O middleware `withAuth` valida o token **localmente** (sem chamar o IdP a
+   cada requisição) e coloca a identidade (`app.Principal`) no contexto.
+   Falhou: `401`, e o handler nem é executado.
+4. Cada handler aplica a regra de autorização da rota antes de qualquer
+   leitura ou gravação.
+
+### Validação do token (`go-oidc`)
+
+| Verificação | Por quê |
+|---|---|
+| assinatura RS256 com as chaves públicas do IdP (JWKS, em cache, renovado quando surge um `kid` novo) | o token foi emitido pelo Keycloak e não foi alterado |
+| `iss` = `OIDC_ISSUER` | emitido pelo realm certo |
+| `aud` contém `OIDC_AUDIENCE` (`wallet-api`) | o token foi emitido **para este serviço**, não para outro sistema |
+| `exp` | não expirou (tokens de 5 minutos) |
+| `typ` = `Bearer` | recusa ID tokens usados como access token |
+
+Se as chaves não puderem ser buscadas (IdP fora do ar e sem cache), a resposta
+é `503` (`ErrTransient`), não `401`. O token nunca é registrado em log.
+
+`OIDC_JWKS_URL` permite buscar as chaves por um endereço diferente do emissor:
+no compose, o emissor é `http://localhost:8081/realms/wallet` (o mesmo `iss`
+dos tokens obtidos de fora) e as chaves vêm de `http://keycloak:8080/...` pela
+rede interna. O Keycloak usa `KC_HOSTNAME` fixo para que o `iss` não dependa
+do endereço usado para pedir o token.
+
+### Modelo de permissões
+
+| Cliente (Keycloak) | Papel | Claim | Pode |
+|---|---|---|---|
+| `provider-a`, `provider-b` | `provider` | `provider_id` (mapper fixo por cliente) | enviar operações **em nome próprio**; consultar as próprias |
+| `wallet-service` | `wallet-admin` | — | abrir/consultar carteiras e ledger; consultar qualquer transação |
+
+| Rota | Regra (`app.Principal`) | Recusa |
+|---|---|---|
+| `POST /wallets`, `GET /wallets/{id}`, `GET /wallets/{id}/ledger` | `CanManageWallets`: papel `wallet-admin` | `403` |
+| `POST /wagering/transactions` | `CanSubmitFor`: papel `provider` **e** `providerId` do corpo = `provider_id` do token | `403`, antes de qualquer gravação |
+| `GET /wagering/transactions/{id}` | `CanReadTransaction`: `wallet-admin`, ou o provedor dono | `404` para outro provedor (não revela que existe) |
+| `GET /providers/{p}/wagering/transactions/{ext}` | `CanQueryProvider`: `wallet-admin`, ou `p` = `provider_id` | `403` |
+| `/health/*` | pública | — |
+
+- **O provedor vem da identidade.** O corpo ainda traz `providerId` (contrato
+  do desafio), mas ele só é aceito se for igual ao do token; o servidor nunca
+  "corrige" um pelo outro.
+- **Replays isolados.** A idempotência é por `(providerId, chave)`. Como o
+  `providerId` precisa ser o do token, o provedor B não consegue reenviar a
+  chave do provedor A para ler o resultado de A: recebe `403` sem corpo
+  financeiro.
+- **O serviço interno não envia operações de provedor:** não tem
+  `provider_id`, então não pode decidir em nome de um provedor.
+
+### Testes (Keycloak real)
+
+`test/integration/auth_test.go` obtém tokens reais por `client_credentials`
+(`internal/testsupport/idptest`) e cobre:
+
+| Cenário | Esperado |
+|---|---|
+| sem token, lixo, payload adulterado (`provider_id` trocado), `alg: none`, assinado por chave de terceiro, expirado (cliente de teste com token de 1 s), de outra audiência (cliente de teste sem o mapper `wallet-api`) | `401` em todas as rotas de negócio, nenhum dado exposto e nenhum efeito financeiro (contagem de carteiras, transações, ledger, outbox e soma de saldos inalterada) |
+| B envia o corpo e a chave de A; A envia em nome de B; interno envia operação | `403`, sem efeitos |
+| B lê transação de A por id / pelo namespace de A | `404` / `403` |
+| provedor tenta abrir/ler carteira ou ledger | `403` |
+| mesmo id externo no namespace de B | operação nova de B, sem receber o resultado de A |
+
+Verificação adversarial registrada: desligando a checagem de audiência, um
+token emitido para outro sistema conseguiu fazer uma aposta (`201`) e o teste
+falhou; removendo a comparação `providerId` do corpo × token, o teste de
+isolamento falhou. Os dois clientes `test-*` do realm existem só para esses
+testes.
+
+Mensageria (SQS): credenciais e políticas do broker, com as validações de
+domínio mantidas no consumidor, na fase 8.

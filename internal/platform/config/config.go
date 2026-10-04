@@ -20,6 +20,7 @@ type Config struct {
 	HTTP       HTTP
 	Database   Database
 	References References
+	Auth       Auth
 
 	StartTimeout    time.Duration // prazo para todas as dependências subirem
 	ShutdownTimeout time.Duration // prazo para concluir o trabalho em andamento
@@ -31,6 +32,13 @@ type HTTP struct {
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
 	IdleTimeout    time.Duration
+}
+
+// Auth descreve o IdP OAuth 2.0/OIDC. Não há modo "sem autenticação".
+type Auth struct {
+	Issuer   string // iss esperado nos tokens
+	Audience string // aud exigida
+	JWKSURL  string // opcional: onde buscar as chaves (padrão: derivado do emissor)
 }
 
 // References configura o worker de referências pendentes.
@@ -81,6 +89,11 @@ func Load(getenv func(string) string) (Config, error) {
 			MaxDelay:      r.dur("REFERENCE_RETRY_MAX_DELAY", 5*time.Minute),
 			MaxAttempts:   r.int("REFERENCE_RETRY_MAX_ATTEMPTS", 12),
 		},
+		Auth: Auth{
+			Issuer:   r.str("OIDC_ISSUER", ""),
+			Audience: r.str("OIDC_AUDIENCE", "wallet-api"),
+			JWKSURL:  r.str("OIDC_JWKS_URL", ""),
+		},
 		StartTimeout:    r.dur("START_TIMEOUT", 30*time.Second),
 		ShutdownTimeout: r.dur("SHUTDOWN_TIMEOUT", 25*time.Second),
 	}
@@ -95,6 +108,9 @@ func (c Config) Validate() error {
 	var errs []error
 	if c.Database.URL == "" {
 		errs = append(errs, errors.New("DATABASE_URL is required"))
+	}
+	if c.Auth.Issuer == "" {
+		errs = append(errs, errors.New("OIDC_ISSUER is required (authentication cannot be disabled)"))
 	}
 	if c.Database.MaxConns < 1 {
 		errs = append(errs, errors.New("DB_MAX_CONNS must be >= 1"))

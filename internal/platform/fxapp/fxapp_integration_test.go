@@ -22,6 +22,7 @@ import (
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/httpapi"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/config"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/fxapp"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/idptest"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/pgtest"
 )
 
@@ -40,6 +41,7 @@ func testConfig(dbURL string) config.Config {
 			WorkerEnabled: true, PollInterval: 50 * time.Millisecond,
 			BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second, MaxAttempts: 5,
 		},
+		Auth:            config.Auth{Issuer: idptest.Issuer(), Audience: "wallet-api"},
 		StartTimeout:    10 * time.Second,
 		ShutdownTimeout: 10 * time.Second,
 	}
@@ -58,6 +60,7 @@ type client struct {
 func (c client) do(method, path, body string) (int, map[string]any) {
 	c.t.Helper()
 	req, _ := http.NewRequest(method, c.base+path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+idptest.Token(c.t, idptest.WalletService))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		c.t.Fatalf("%s %s: %v", method, path, err)

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/httpapi"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/config"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/fxapp"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/idptest"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/pgtest"
 )
 
@@ -39,6 +41,7 @@ func Config(dbURL string) config.Config {
 			WorkerEnabled: true, PollInterval: 50 * time.Millisecond,
 			BaseDelay: 100 * time.Millisecond, MaxDelay: time.Second, MaxAttempts: 5,
 		},
+		Auth:         config.Auth{Issuer: idptest.Issuer(), Audience: "wallet-api"},
 		StartTimeout: 10 * time.Second, ShutdownTimeout: 10 * time.Second,
 	}
 }
@@ -84,6 +87,10 @@ type Client struct {
 	t    testing.TB
 	base string
 	http *http.Client
+	// fixed, quando definido, força este token (ou nenhum, se fixedNone)
+	// em todas as requisições: usado nos testes de autenticação.
+	fixed     string
+	fixedNone bool
 }
 
 func NewClient(t testing.TB, base string) *Client {
@@ -91,6 +98,40 @@ func NewClient(t testing.TB, base string) *Client {
 		Timeout:   15 * time.Second,
 		Transport: &http.Transport{MaxIdleConnsPerHost: 100},
 	}}
+}
+
+// As devolve um cliente que usa sempre o token informado ("" = sem token).
+func (c *Client) As(token string) *Client {
+	cp := *c
+	cp.fixed, cp.fixedNone = token, token == ""
+	return &cp
+}
+
+// AsClient devolve um cliente que usa o token real do cliente OAuth indicado.
+func (c *Client) AsClient(clientID string) *Client {
+	return c.As(idptest.Token(c.t, clientID))
+}
+
+// tokenFor escolhe a identidade adequada para cada rota, imitando quem
+// chamaria aquela rota de verdade:
+//   - /wallets...                 -> serviço interno (wallet-admin)
+//   - /providers/{p}/...          -> o próprio provedor p
+//   - POST /wagering/transactions -> o provedor do corpo (ver Submit)
+//   - GET /wagering/transactions  -> serviço interno
+func (c *Client) tokenFor(method, path string) string {
+	switch {
+	case c.fixedNone:
+		return ""
+	case c.fixed != "":
+		return c.fixed
+	case strings.HasPrefix(path, "/providers/"):
+		p, _, _ := strings.Cut(strings.TrimPrefix(path, "/providers/"), "/")
+		return idptest.Token(c.t, p)
+	case strings.HasPrefix(path, "/health/"):
+		return ""
+	default:
+		return idptest.Token(c.t, idptest.WalletService)
+	}
 }
 
 // Base devolve o endereço base (ex.: http://127.0.0.1:8080).
@@ -133,6 +174,9 @@ func (c *Client) Do(method, path string, body any, headers ...string) Response {
 	}
 	req, _ := http.NewRequestWithContext(context.Background(), method, c.base+path, rd)
 	req.Header.Set("Content-Type", "application/json")
+	if tok := c.tokenFor(method, path); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
 	}
@@ -185,6 +229,10 @@ func (c *Client) Submit(o Op) Response {
 	key := o.Key
 	if key == "" {
 		key = o.Provider + ":" + o.ExternalID
+	}
+	if c.fixed == "" && !c.fixedNone {
+		// o provedor do corpo envia com o próprio token
+		return c.As(idptest.Token(c.t, o.Provider)).Do("POST", "/wagering/transactions", o.Body(), httpapi.HeaderIdempotencyKey, key)
 	}
 	return c.Do("POST", "/wagering/transactions", o.Body(), httpapi.HeaderIdempotencyKey, key)
 }

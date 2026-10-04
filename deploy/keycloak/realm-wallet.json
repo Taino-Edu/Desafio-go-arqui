@@ -6,8 +6,14 @@
   "registrationAllowed": false,
   "roles": {
     "realm": [
-      { "name": "provider", "description": "Provedor de jogos: envia e consulta as próprias transações" },
-      { "name": "wallet-admin", "description": "Serviço interno: carteiras, ledger e reconciliação" }
+      {
+        "name": "provider",
+        "description": "Provedor de jogos: envia e consulta as próprias transações"
+      },
+      {
+        "name": "wallet-admin",
+        "description": "Serviço interno: carteiras, ledger e reconciliação"
+      }
     ]
   },
   "clients": [
@@ -113,6 +119,76 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "test-provider-a-short-lived",
+      "name": "TESTE: provider-a com token de 1 segundo",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "test-short-lived-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "provider_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "provider_id",
+            "claim.value": "provider-a",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience wallet-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "wallet-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "attributes": {
+        "access.token.lifespan": "1"
+      }
+    },
+    {
+      "clientId": "test-other-audience",
+      "name": "TESTE: provider-a sem a audiência wallet-api",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "test-other-audience-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "provider_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "provider_id",
+            "claim.value": "provider-a",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "users": [
@@ -120,19 +196,41 @@
       "username": "service-account-provider-a",
       "enabled": true,
       "serviceAccountClientId": "provider-a",
-      "realmRoles": ["provider"]
+      "realmRoles": [
+        "provider"
+      ]
     },
     {
       "username": "service-account-provider-b",
       "enabled": true,
       "serviceAccountClientId": "provider-b",
-      "realmRoles": ["provider"]
+      "realmRoles": [
+        "provider"
+      ]
     },
     {
       "username": "service-account-wallet-service",
       "enabled": true,
       "serviceAccountClientId": "wallet-service",
-      "realmRoles": ["wallet-admin"]
+      "realmRoles": [
+        "wallet-admin"
+      ]
+    },
+    {
+      "username": "service-account-test-provider-a-short-lived",
+      "enabled": true,
+      "serviceAccountClientId": "test-provider-a-short-lived",
+      "realmRoles": [
+        "provider"
+      ]
+    },
+    {
+      "username": "service-account-test-other-audience",
+      "enabled": true,
+      "serviceAccountClientId": "test-other-audience",
+      "realmRoles": [
+        "provider"
+      ]
     }
   ]
 }

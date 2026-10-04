@@ -80,6 +80,9 @@ func toWalletResponse(w *wallet.Wallet) walletResponse {
 
 // POST /wallets
 func (h walletHandlers) open(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	var req openWalletRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		writeError(w, r, h.log, err)
@@ -109,6 +112,9 @@ func (h walletHandlers) open(w http.ResponseWriter, r *http.Request) {
 
 // GET /wallets/{walletId}
 func (h walletHandlers) get(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	id, err := parseUUID("walletId", r.PathValue("walletId"))
 	if err != nil {
 		writeError(w, r, h.log, err)
@@ -141,6 +147,9 @@ type ledgerPageResponse struct {
 
 // GET /wallets/{walletId}/ledger?cursor=...&limit=50
 func (h walletHandlers) ledger(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
 	id, err := parseUUID("walletId", r.PathValue("walletId"))
 	if err != nil {
 		writeError(w, r, h.log, err)
@@ -173,4 +182,17 @@ func (h walletHandlers) ledger(w http.ResponseWriter, r *http.Request) {
 		resp.NextCursor = &page.NextCursor
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// authorize: operações de carteira são restritas ao serviço interno.
+func (h walletHandlers) authorize(w http.ResponseWriter, r *http.Request) bool {
+	p, err := principal(r)
+	if err == nil {
+		err = p.CanManageWallets()
+	}
+	if err != nil {
+		writeError(w, r, h.log, err)
+		return false
+	}
+	return true
 }

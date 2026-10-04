@@ -69,6 +69,18 @@ func (h wagerHandlers) submit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, h.log, err)
 		return
 	}
+	// O provedor é o da identidade autenticada. Um corpo com outro
+	// providerId é recusado ANTES de qualquer gravação.
+	p, err := principal(r)
+	if err == nil {
+		err = p.CanSubmitFor(in.ProviderID)
+	}
+	if err != nil {
+		h.log.WarnContext(r.Context(), "submit forbidden", "clientId", p.ClientID,
+			"identityProviderId", p.ProviderID, "bodyProviderId", in.ProviderID)
+		writeError(w, r, h.log, err)
+		return
+	}
 
 	res, err := h.svc.Submit(r.Context(), in)
 	if err != nil {
@@ -196,7 +208,15 @@ func (h wagerHandlers) getByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, h.log, err)
 		return
 	}
+	p, err := principal(r)
+	if err != nil {
+		writeError(w, r, h.log, err)
+		return
+	}
 	tx, err := h.svc.GetTransaction(r.Context(), id)
+	if err == nil {
+		err = p.CanReadTransaction(tx) // de outro provedor: 404, sem revelar que existe
+	}
 	if err != nil {
 		writeError(w, r, h.log, err)
 		return
@@ -206,6 +226,14 @@ func (h wagerHandlers) getByID(w http.ResponseWriter, r *http.Request) {
 
 // GET /providers/{providerId}/wagering/transactions/{externalTransactionId}
 func (h wagerHandlers) getByExternalID(w http.ResponseWriter, r *http.Request) {
+	p, err := principal(r)
+	if err == nil {
+		err = p.CanQueryProvider(r.PathValue("providerId"))
+	}
+	if err != nil {
+		writeError(w, r, h.log, err)
+		return
+	}
 	tx, err := h.svc.GetByExternalID(r.Context(), r.PathValue("providerId"), r.PathValue("externalTransactionId"))
 	if err != nil {
 		writeError(w, r, h.log, err)

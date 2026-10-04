@@ -14,12 +14,15 @@ func env(m map[string]string) func(string) string {
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	cfg, err := config.Load(env(map[string]string{"DATABASE_URL": "postgres://x"}))
+	cfg, err := config.Load(env(map[string]string{"DATABASE_URL": "postgres://x", "OIDC_ISSUER": "http://idp/realms/w"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.HTTP.Addr != ":8080" || cfg.Database.MaxConns != 20 || cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("defaults = %+v", cfg)
+	}
+	if cfg.Auth.Audience != "wallet-api" {
+		t.Errorf("audience padrão = %q", cfg.Auth.Audience)
 	}
 	if !cfg.References.WorkerEnabled || cfg.References.MaxAttempts != 12 {
 		t.Errorf("references = %+v", cfg.References)
@@ -31,7 +34,7 @@ func TestLoad_Defaults(t *testing.T) {
 
 func TestLoad_Overrides(t *testing.T) {
 	cfg, err := config.Load(env(map[string]string{
-		"DATABASE_URL": "postgres://x", "HTTP_ADDR": ":9999", "DB_MAX_CONNS": "5",
+		"DATABASE_URL": "postgres://x", "OIDC_ISSUER": "http://idp/realms/w", "HTTP_ADDR": ":9999", "DB_MAX_CONNS": "5",
 		"LOG_LEVEL": "debug", "SHUTDOWN_TIMEOUT": "40s", "INSTANCE_ID": "i-1",
 	}))
 	if err != nil {
@@ -49,6 +52,7 @@ func TestLoad_Invalid(t *testing.T) {
 		want string
 	}{
 		"sem banco":            {map[string]string{}, "DATABASE_URL is required"},
+		"sem IdP":              {map[string]string{"DATABASE_URL": "x"}, "OIDC_ISSUER is required"},
 		"duração inválida":     {map[string]string{"DATABASE_URL": "x", "DB_LOCK_TIMEOUT": "3"}, "DB_LOCK_TIMEOUT: invalid duration"},
 		"inteiro inválido":     {map[string]string{"DATABASE_URL": "x", "DB_MAX_CONNS": "dez"}, "DB_MAX_CONNS: invalid integer"},
 		"nível inválido":       {map[string]string{"DATABASE_URL": "x", "LOG_LEVEL": "loud"}, "LOG_LEVEL: invalid level"},

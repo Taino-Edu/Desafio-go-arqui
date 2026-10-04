@@ -24,21 +24,26 @@ type Config struct {
 }
 
 // NewHandler monta as rotas e os middlewares.
-func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers *app.WagerService, health *Health) http.Handler {
+func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers *app.WagerService,
+	health *Health, verifier TokenVerifier) http.Handler {
 	wh := walletHandlers{svc: wallets, log: log}
 	gh := wagerHandlers{svc: wagers, log: log}
 
+	// públicas
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", health.live)
 	mux.HandleFunc("GET /health/ready", health.ready)
 
-	mux.HandleFunc("POST /wallets", wh.open)
-	mux.HandleFunc("GET /wallets/{walletId}", wh.get)
-	mux.HandleFunc("GET /wallets/{walletId}/ledger", wh.ledger)
+	// negócio: sempre autenticadas; a autorização fica em cada handler
+	protect := func(h http.HandlerFunc) http.Handler { return withAuth(verifier, log, h) }
 
-	mux.HandleFunc("POST /wagering/transactions", gh.submit)
-	mux.HandleFunc("GET /wagering/transactions/{transactionId}", gh.getByID)
-	mux.HandleFunc("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", gh.getByExternalID)
+	mux.Handle("POST /wallets", protect(wh.open))
+	mux.Handle("GET /wallets/{walletId}", protect(wh.get))
+	mux.Handle("GET /wallets/{walletId}/ledger", protect(wh.ledger))
+
+	mux.Handle("POST /wagering/transactions", protect(gh.submit))
+	mux.Handle("GET /wagering/transactions/{transactionId}", protect(gh.getByID))
+	mux.Handle("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", protect(gh.getByExternalID))
 
 	var h http.Handler = mux
 	h = withTimeout(cfg.RequestTimeout, h)

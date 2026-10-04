@@ -4,9 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **6 — worker de referências pendentes**.
->
-> ⚠️ Autenticação ainda não está ligada nos endpoints (fase 7).
+> 🚧 Em construção. Fase atual: **7 — autenticação e autorização (Keycloak)**.
 
 ## Documentação
 
@@ -39,19 +37,35 @@ docker compose down -v            # derruba e apaga os dados
 | PostgreSQL | `localhost:5432/wallet` | app `wallet_app/wallet_app`, migrations `wallet_owner/wallet_owner` |
 | LocalStack (SQS) | `http://localhost:4566` | `test/test` |
 | Keycloak | `http://localhost:8081` | admin `admin/admin`; realm `wallet` |
-| API | `http://localhost:8080` | (autenticação na fase 7) |
+| API | `http://localhost:8080` | token do Keycloak (`client_credentials`), ver abaixo |
 
-### Exemplos
+### Exemplos (fluxo autenticado)
+
+Clientes de teste do realm `wallet` (provisionados automaticamente):
+
+| `client_id` | `client_secret` | Papel | Uso |
+|---|---|---|---|
+| `wallet-service` | `wallet-service-secret` | `wallet-admin` | carteiras, ledger, consulta de qualquer transação |
+| `provider-a` | `provider-a-secret` | `provider` (`provider_id=provider-a`) | operações do provedor A |
+| `provider-b` | `provider-b-secret` | `provider` (`provider_id=provider-b`) | operações do provedor B |
 
 ```sh
-# abrir carteira
-curl -s -X POST localhost:8080/wallets -H 'Content-Type: application/json' -d '{
+token() {
+  curl -s -d grant_type=client_credentials -d client_id="$1" -d client_secret="$2" \
+    http://localhost:8081/realms/wallet/protocol/openid-connect/token | jq -r .access_token
+}
+ADMIN=$(token wallet-service wallet-service-secret)
+PROVIDER_A=$(token provider-a provider-a-secret)
+
+# abrir carteira (serviço interno)
+curl -s -X POST localhost:8080/wallets -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' -d '{
   "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
   "initialBalance": {"amount": "1000.00", "currency": "BRL"}
 }'
 
-# aposta (Idempotency-Key obrigatório)
-curl -s -X POST localhost:8080/wagering/transactions \
+# aposta (provedor A; Idempotency-Key obrigatório; providerId = o do token)
+curl -s -X POST localhost:8080/wagering/transactions -H "Authorization: Bearer $PROVIDER_A" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' -d '{
   "providerId": "provider-a", "externalTransactionId": "transaction-123",
   "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1", "walletId": "<walletId>",
@@ -60,24 +74,28 @@ curl -s -X POST localhost:8080/wagering/transactions \
 }'
 # repita o mesmo comando: 200 com "idempotentReplay": true e o mesmo saldo
 
-curl -s localhost:8080/wagering/transactions/<transactionId>
-curl -s localhost:8080/providers/provider-a/wagering/transactions/transaction-123
-curl -s localhost:8080/wallets/<walletId>
-curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50'
-curl -s localhost:8080/health/ready
+curl -s localhost:8080/providers/provider-a/wagering/transactions/transaction-123 -H "Authorization: Bearer $PROVIDER_A"
+curl -s localhost:8080/wagering/transactions/<transactionId> -H "Authorization: Bearer $ADMIN"
+curl -s localhost:8080/wallets/<walletId> -H "Authorization: Bearer $ADMIN"
+curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50' -H "Authorization: Bearer $ADMIN"
+curl -s localhost:8080/health/ready   # público
 ```
 
 ### Rodar a API fora do Docker
 
 ```sh
-docker compose up -d postgres migrate
+docker compose up -d postgres migrate keycloak
 DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=disable' \
+  OIDC_ISSUER=http://localhost:8081/realms/wallet \
   HTTP_ADDR=:8080 go run ./cmd/server
 ```
 
 | Variável | Padrão | Uso |
 |---|---|---|
 | `DATABASE_URL` | — (obrigatória) | conexão com o papel `wallet_app` |
+| `OIDC_ISSUER` | — (obrigatória) | emissor esperado nos tokens; não existe modo sem autenticação |
+| `OIDC_AUDIENCE` | `wallet-api` | audiência exigida |
+| `OIDC_JWKS_URL` | `<issuer>/protocol/openid-connect/certs` | onde buscar as chaves públicas |
 | `HTTP_ADDR` | `:8080` | endereço do servidor |
 | `INSTANCE_ID` | hostname | identifica a instância nos logs |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
@@ -89,14 +107,6 @@ DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=dis
 | `REFERENCE_WORKER_INTERVAL` | `1s` | espera do worker quando não há pendência vencida |
 | `REFERENCE_RETRY_BASE_DELAY` / `REFERENCE_RETRY_MAX_DELAY` | `1s` / `5m` | backoff exponencial entre tentativas |
 | `REFERENCE_RETRY_MAX_ATTEMPTS` | `12` | depois disso: `REJECTED` com `REFERENCE_NOT_FOUND` |
-
-Obter um token de teste (fluxo `client_credentials`):
-
-```sh
-curl -s -d grant_type=client_credentials \
-     -d client_id=provider-a -d client_secret=provider-a-secret \
-     http://localhost:8081/realms/wallet/protocol/openid-connect/token
-```
 
 Listar as filas:
 
@@ -123,9 +133,12 @@ go test ./...                       # unitários
 go test -race ./...                 # unitários com detector de race condition
 go vet ./...
 
-# integração: Postgres real, um banco descartável por teste
-docker compose up -d postgres
+# integração: Postgres e Keycloak reais, um banco descartável por teste
+docker compose up -d postgres keycloak
 go test -tags=integration -race ./...
+
+# autenticação e isolamento entre provedores (Keycloak real)
+go test -tags=integration -race -run 'TestAuth' ./test/integration/
 
 # só os testes de concorrência e de 3 instâncias (compila cmd/server e sobe 3 processos)
 go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeIndependentInstances' ./test/integration/
@@ -150,12 +163,14 @@ internal/domain/
   domainerr/                 erros de validação compartilhados
 internal/app/                casos de uso e portas (interfaces)
 internal/adapters/postgres/  repositórios pgx, transação (Store), migrations
-internal/adapters/httpapi/   rotas, middlewares, erros, health
+internal/adapters/httpapi/   rotas, middlewares (inclusive autenticação), erros, health
+internal/adapters/auth/      validação de JWT do Keycloak (OIDC, JWKS)
 internal/platform/config/    configuração por variáveis de ambiente
 internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
 internal/worker/             loop genérico de trabalho em segundo plano (parada observável)
 internal/testsupport/pgtest/ banco descartável para testes de integração
-internal/testsupport/apptest/ aplicação completa + cliente HTTP para testes de ponta a ponta
+internal/testsupport/apptest/ aplicação completa + cliente HTTP (com tokens reais) para testes
+internal/testsupport/idptest/ obtém tokens do Keycloak (client_credentials) para os testes
 test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak

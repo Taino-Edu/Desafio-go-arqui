@@ -14,6 +14,8 @@ import (
 // Códigos de erro do contrato HTTP (campo error.code).
 const (
 	CodeInvalidRequest         = "INVALID_REQUEST"
+	CodeUnauthenticated        = "UNAUTHENTICATED"
+	CodeForbidden              = "FORBIDDEN"
 	CodeNotFound               = "NOT_FOUND"
 	CodeWalletAlreadyExists    = "WALLET_ALREADY_EXISTS"
 	CodeIdempotencyKeyReused   = "IDEMPOTENCY_KEY_REUSED"
@@ -61,6 +63,10 @@ func classifyError(err error) (int, ErrorBody) {
 		errors.Is(err, app.ErrInvalidCursor),
 		errors.Is(err, errBadRequest):
 		return http.StatusBadRequest, errBody(CodeInvalidRequest, err.Error(), "")
+	case errors.Is(err, app.ErrUnauthenticated):
+		return http.StatusUnauthorized, errBody(CodeUnauthenticated, "missing, invalid or expired access token", "")
+	case errors.Is(err, app.ErrForbidden):
+		return http.StatusForbidden, errBody(CodeForbidden, "not allowed for this identity", "")
 	case errors.Is(err, app.ErrWalletNotFound):
 		return http.StatusNotFound, errBody(CodeNotFound, "wallet not found", "")
 	case errors.Is(err, app.ErrTransactionNotFound):

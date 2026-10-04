@@ -31,6 +31,8 @@ func TestClassifyError(t *testing.T) {
 		{app.ErrWalletNotFound, 404, CodeNotFound},
 		{app.ErrWalletAlreadyExists, 409, CodeWalletAlreadyExists},
 		{app.ErrTransactionNotFound, 404, CodeNotFound},
+		{app.ErrUnauthenticated, 401, CodeUnauthenticated},
+		{app.ErrForbidden, 403, CodeForbidden},
 		{app.ErrIdempotencyKeyReused, 409, CodeIdempotencyKeyReused},
 		{app.ErrDuplicateTransaction, 409, CodeDuplicateTransaction},
 		{fmt.Errorf("%w: deadlock", app.ErrTransient), 503, CodeTemporarilyUnavailable},

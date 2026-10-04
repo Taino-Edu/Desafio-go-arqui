@@ -21,6 +21,7 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/auth"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/httpapi"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/postgres"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
@@ -120,6 +121,11 @@ var HTTPModule = fx.Module("http",
 		},
 		func(pool *pgxpool.Pool) *httpapi.Health {
 			return httpapi.NewHealth(2*time.Second, postgres.HealthChecker{Pool: pool})
+		},
+		func(cfg config.Config) (httpapi.TokenVerifier, error) {
+			return auth.NewVerifier(auth.Config{
+				Issuer: cfg.Auth.Issuer, Audience: cfg.Auth.Audience, JWKSURL: cfg.Auth.JWKSURL,
+			})
 		},
 		httpapi.NewHandler,
 		httpapi.NewServer,
