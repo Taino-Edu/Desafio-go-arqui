@@ -121,6 +121,9 @@ services:
       SQS_INPUT_QUEUE: wager-transactions.fifo
       SQS_INPUT_DLQ: wager-transactions-dlq.fifo
       SQS_ALLOWED_PROVIDERS: provider-a,provider-b
+      # publicador da outbox -> fila de eventos (usa a mesma conexão SQS)
+      OUTBOX_PUBLISHER_ENABLED: "true"
+      OUTBOX_QUEUE: wallet-events.fifo
     ports:
       - "${APP_PORT:-8080}:8080"
     # o compose espera até 30s pelo shutdown gracioso antes de matar

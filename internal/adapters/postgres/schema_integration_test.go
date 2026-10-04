@@ -11,6 +11,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/postgres"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/pgtest"
+	"github.com/Taino-Edu/Desafio-go-arqui/migrations"
 )
 
 // Códigos SQLSTATE usados nas asserções.
@@ -205,11 +207,21 @@ func debit(t *testing.T, p *pgxpool.Pool, w wallet, extID string, amount int64) 
 
 // ---------- migrations ----------
 
+// latestMigration conta os arquivos .up.sql: a versão esperada após "up".
+func latestMigration(t *testing.T) uint {
+	ups, err := fs.Glob(migrations.FS, "*.up.sql")
+	if err != nil || len(ups) == 0 {
+		t.Fatalf("migrations: %v", err)
+	}
+	return uint(len(ups))
+}
+
 func TestMigrations_UpDownUp(t *testing.T) {
 	db := pgtest.New(t)
 	c := ctx(t)
+	latest := latestMigration(t)
 
-	if v, dirty, err := postgres.MigrationVersion(db.OwnerURL); err != nil || v != 1 || dirty {
+	if v, dirty, err := postgres.MigrationVersion(db.OwnerURL); err != nil || v != latest || dirty {
 		t.Fatalf("versão após up = %d dirty=%t err=%v", v, dirty, err)
 	}
 	db.App.Close() // libera conexões antes do DROP TABLE
@@ -227,7 +239,7 @@ func TestMigrations_UpDownUp(t *testing.T) {
 	if err := postgres.MigrateUp(db.OwnerURL); err != nil {
 		t.Fatalf("up de novo: %v", err)
 	}
-	if v, _, _ := postgres.MigrationVersion(db.OwnerURL); v != 1 {
+	if v, _, _ := postgres.MigrationVersion(db.OwnerURL); v != latest {
 		t.Errorf("versão após reaplicar = %d", v)
 	}
 }

@@ -17,8 +17,8 @@ correspondente é implementada (ver o roteiro em
 | [Referências pendentes e worker](#referências-pendentes-e-worker) | ✅ |
 | [Autenticação e autorização](#autenticação-e-autorização) | ✅ HTTP (OIDC) e SQS (credenciais e política do broker) |
 | [Inbox, SQS e DLQ](#inbox-sqs-e-dlq) | ✅ |
-| Outbox | ⏳ fase 9 |
-| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco, worker de referências e consumidor SQS; outbox na fase 9 |
+| [Outbox](#outbox-publicação-de-eventos) | ✅ |
+| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco, worker de referências, consumidor SQS e publicador da outbox |
 | Observabilidade | ⏳ fase 10 |
 
 ---
@@ -292,7 +292,7 @@ Valem mesmo que o código Go tenha um bug ou que alguém acesse o banco direto.
 | máquina de estados | trigger `wager_tx_guard_update`: terminal não muda; só transições válidas; campos de negócio imutáveis |
 | registros financeiros não são apagados | triggers em `wallets` e `wager_transactions` |
 | inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
-| payload da outbox é snapshot | trigger `outbox_guard_update`; `published_at` não volta a nulo |
+| payload da outbox é snapshot | trigger `outbox_guard_update` (inclusive `seq`, migration 000002); `published_at` não volta a nulo |
 
 Com o encadeamento e a checagem adiada, o saldo armazenado é sempre igual ao
 último `balance_after` da cadeia de lançamentos, e a cadeia começa em zero.
@@ -393,7 +393,9 @@ Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
 | `postgres` | `*pgxpool.Pool`, `app.Store` | OnStart: ping (sem banco, não sobe). OnStop: fecha o pool |
 | `app` | `Clock`, `IDGenerator`, `WalletService` | — |
 | `http` | `Health`, handler, `*httpapi.Server` | `fx.Invoke` registra OnStart (abre a porta) e OnStop (shutdown gracioso) |
-| `sqs` (se `SQS_ENABLED`) | cliente SQS, `Checker` de readiness | OnStart resolve as URLs das filas (sem filas, não sobe) e inicia os pollers; OnStop para de receber, conclui as mensagens em andamento e libera as não iniciadas |
+| `aws` (se consumidor ou publicador ligado) | cliente SQS compartilhado | — |
+| `outbox` (se `OUTBOX_PUBLISHER_ENABLED`) | — | OnStart resolve a fila de eventos (sem fila, não sobe) e inicia o loop; OnStop termina o lote em andamento (o que não for publicado volta quando o arrendamento vencer) |
+| `sqs` (se `SQS_ENABLED`) | `Checker` de readiness | OnStart resolve as URLs das filas (sem filas, não sobe) e inicia os pollers; OnStop para de receber, conclui as mensagens em andamento e libera as não iniciadas |
 | `workers` | — | `fx.Invoke` registra o loop do worker de referências: OnStart inicia a goroutine; OnStop para de buscar trabalho, espera o item em andamento e, se o prazo acabar, cancela o item (a transação é desfeita) |
 
 - **Partida:** `cmd/server` valida a configuração antes do Fx (inválida → sai
@@ -866,3 +868,89 @@ envio para a DLQ falhar, a mensagem não é apagada (o redrive resolve).
 Cada teste cria filas próprias no LocalStack. A queda é simulada com um gancho
 (`Hooks.AfterCommit`) que faz o consumidor parar sem apagar nem alterar a
 visibilidade, como um processo derrubado nesse instante.
+
+---
+
+## Outbox: publicação de eventos
+
+Arquivos: [`app/outbox_publisher.go`](internal/app/outbox_publisher.go),
+[`postgres/outbox.go`](internal/adapters/postgres/outbox.go),
+[`sqsconsumer/publisher.go`](internal/adapters/sqsconsumer/publisher.go),
+[`migrations/000002_outbox_sequence.up.sql`](migrations/000002_outbox_sequence.up.sql).
+
+### Por que outbox
+
+Gravar no banco e publicar numa fila são duas operações em dois sistemas, sem
+atomicidade entre eles ("dual write"). Publicar antes do commit pode anunciar
+algo que não aconteceu; publicar depois pode perder o evento se o processo
+cair no meio. Com a outbox, o evento é gravado **na mesma transação** do saldo,
+do ledger e do estado da operação, e um worker separado publica depois. Como a
+outbox só contém linhas de transações confirmadas, nada é publicado antes do
+commit, e nada confirmado se perde.
+
+### Ciclo de um evento
+
+```
+transação de negócio  ── INSERT outbox_events (seq, payload, next_attempt_at = occurred_at)  ── COMMIT
+publicador            ── Claim (transação curta, confirmada): attempts+1, locked_by, locked_until = agora + lease
+                      ── SendMessage para wallet-events.fifo   (fora de transação)
+                      ── sucesso: published_at = agora, libera o arrendamento
+                      ── falha:   next_attempt_at = agora + backoff, last_error, libera o arrendamento
+```
+
+### Reivindicação (`Claim`)
+
+- **Ordem por agregado:** só o evento pendente de menor `seq` de cada agregado
+  (a "cabeça") pode ser reivindicado; o seguinte espera a cabeça ser
+  publicada. `seq` é uma coluna identidade atribuída no `INSERT` (migration
+  000002); como os eventos de uma carteira são gravados com a carteira
+  travada, `seq` segue a ordem das versões da carteira sem depender do relógio
+  das instâncias.
+- **Vários publicadores:** `FOR UPDATE SKIP LOCKED` faz cada instância pegar
+  cabeças diferentes, sem esperar.
+- **Arrendamento (lease, `OUTBOX_LEASE`, padrão 30s):** a reserva é gravada e
+  confirmada antes da publicação. Enquanto vale, ninguém mais pega o evento;
+  se a instância cair, o arrendamento vence e outra instância o retoma
+  (trabalho abandonado).
+- **Backoff:** `min(OUTBOX_RETRY_BASE_DELAY × 2^(tentativas−1), OUTBOX_RETRY_MAX_DELAY)`
+  (1s até 5min). Não há limite de tentativas nem estado "morto": um evento
+  confirmado nunca é descartado. Uma cabeça que falha segura os eventos
+  seguintes do mesmo agregado (head-of-line), o que preserva a ordem; os
+  outros agregados seguem.
+
+### Garantia de entrega
+
+**At-least-once, com `eventId` estável.** Se o processo cair entre publicar e
+marcar `published_at`, outra instância republica o mesmo registro, com o
+mesmo `eventId` e o mesmo payload (a linha é imutável). O SQS FIFO descarta a
+cópia dentro de 5 minutos (`MessageDeduplicationId = eventId`); fora dessa
+janela, o consumidor deduplica por `eventId`.
+
+### Contrato de roteamento e consumo (`wallet-events.fifo`)
+
+| Item | Valor |
+|---|---|
+| corpo | envelope JSON do evento (`eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId`, `occurredAt`, `version`, `data`); a coluna é `JSONB`, que normaliza espaços e ordem das chaves |
+| `MessageGroupId` | `aggregateId`: ordem por carteira (`WalletBalanceChanged`) e por transação |
+| `MessageDeduplicationId` | `eventId` |
+| atributos | `eventType`, `eventVersion`, `aggregateType`, `correlationId` (filtro sem abrir o corpo) |
+| DLQ | `wallet-events-dlq.fifo` (`maxReceiveCount=5`) para consumidores que falharem |
+
+Regras para quem consome: deduplicar por `eventId`; tratar `walletVersion` de
+`WalletBalanceChanged` como sequência por carteira (lacuna = evento ainda por
+vir ou perdido no consumidor); valores monetários são strings decimais.
+
+### Testes (`test/integration/outbox_test.go`, LocalStack real)
+
+| Teste | Comprova |
+|---|---|
+| `PublishesCommittedEvents` | abertura + aposta geram 4 eventos com o contrato de roteamento; linhas marcadas e liberadas |
+| `UncommittedEventsAreNotPublished` | evento de transação aberta não é visto; depois do commit, é publicado |
+| `CompetingPublishersKeepOrderPerAggregate` | 3 publicadores, 90 eventos de 5 carteiras: cada evento enviado uma vez e `walletVersion` entregue em ordem (1..9) por carteira |
+| `RecoversAbandonedClaim` | **queda entre o commit e a publicação**: a reivindicação abandonada é retomada por outra instância após o arrendamento |
+| `CrashBetweenPublishAndMarkRepublishesSameEventID` | **queda entre a publicação e a confirmação**: outra instância republica o mesmo `eventId`; a fila tem uma cópia |
+| `FailureBacksOffAndKeepsOrder` | falha registra `last_error` e agenda backoff; o segundo evento do agregado só sai depois do primeiro |
+
+Verificação adversarial registrada: removendo a regra da "cabeça" do
+agregado, os eventos de uma carteira chegaram na ordem `[8 9 1 2 3 4 5 6 7]`
+e os dois testes de ordem falharam.

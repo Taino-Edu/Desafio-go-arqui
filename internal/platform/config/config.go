@@ -22,6 +22,7 @@ type Config struct {
 	References References
 	Auth       Auth
 	SQS        SQS
+	Outbox     Outbox
 
 	StartTimeout    time.Duration // prazo para todas as dependências subirem
 	ShutdownTimeout time.Duration // prazo para concluir o trabalho em andamento
@@ -35,7 +36,20 @@ type HTTP struct {
 	IdleTimeout    time.Duration
 }
 
-// SQS configura o consumidor da fila de entrada.
+// Outbox configura o publicador da outbox. Usa a conexão SQS (região,
+// endpoint, credenciais) da seção SQS.
+type Outbox struct {
+	Enabled        bool
+	Queue          string        // fila de eventos (nome ou URL)
+	BatchSize      int           // eventos reivindicados por rodada
+	PollInterval   time.Duration // espera quando não há eventos
+	Lease          time.Duration // reserva de um evento reivindicado
+	RetryBaseDelay time.Duration // backoff de falha de publicação
+	RetryMaxDelay  time.Duration
+}
+
+// SQS configura o acesso ao SQS e o consumidor da fila de entrada
+// (Enabled liga o consumidor).
 type SQS struct {
 	Enabled          bool
 	Region           string
@@ -124,6 +138,15 @@ func Load(getenv func(string) string) (Config, error) {
 			RetryMaxDelay:    r.dur("SQS_RETRY_MAX_DELAY", time.Minute),
 			AllowedProviders: r.list("SQS_ALLOWED_PROVIDERS"),
 		},
+		Outbox: Outbox{
+			Enabled:        r.bool("OUTBOX_PUBLISHER_ENABLED", true),
+			Queue:          r.str("OUTBOX_QUEUE", "wallet-events.fifo"),
+			BatchSize:      r.int("OUTBOX_BATCH_SIZE", 50),
+			PollInterval:   r.dur("OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
+			Lease:          r.dur("OUTBOX_LEASE", 30*time.Second),
+			RetryBaseDelay: r.dur("OUTBOX_RETRY_BASE_DELAY", time.Second),
+			RetryMaxDelay:  r.dur("OUTBOX_RETRY_MAX_DELAY", 5*time.Minute),
+		},
 		Auth: Auth{
 			Issuer:   r.str("OIDC_ISSUER", ""),
 			Audience: r.str("OIDC_AUDIENCE", "wallet-api"),
@@ -187,6 +210,17 @@ func (c Config) Validate() error {
 		}
 		if c.SQS.RetryBaseDelay < time.Second || c.SQS.RetryMaxDelay < c.SQS.RetryBaseDelay || c.SQS.RetryMaxDelay > 12*time.Hour {
 			errs = append(errs, errors.New("SQS_RETRY_BASE_DELAY must be >= 1s and <= SQS_RETRY_MAX_DELAY <= 12h"))
+		}
+	}
+	if c.Outbox.Enabled {
+		if c.Outbox.Queue == "" || c.Outbox.BatchSize < 1 || c.Outbox.BatchSize > 1000 {
+			errs = append(errs, errors.New("OUTBOX_QUEUE is required and OUTBOX_BATCH_SIZE must be between 1 and 1000"))
+		}
+		if c.Outbox.PollInterval <= 0 || c.Outbox.Lease < time.Second {
+			errs = append(errs, errors.New("OUTBOX_POLL_INTERVAL must be positive and OUTBOX_LEASE >= 1s"))
+		}
+		if c.Outbox.RetryBaseDelay <= 0 || c.Outbox.RetryMaxDelay < c.Outbox.RetryBaseDelay {
+			errs = append(errs, errors.New("OUTBOX_RETRY_BASE_DELAY must be positive and <= OUTBOX_RETRY_MAX_DELAY"))
 		}
 	}
 	if c.Database.LockTimeout >= c.HTTP.RequestTimeout {

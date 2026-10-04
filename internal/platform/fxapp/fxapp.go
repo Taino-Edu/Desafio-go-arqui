@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -48,7 +49,9 @@ func New(cfg config.Config, extra ...fx.Option) fx.Option {
 		AppModule,
 		HTTPModule,
 		WorkersModule,
+		awsModule(cfg),
 		sqsModule(cfg),
+		outboxModule(cfg),
 		fx.Options(extra...),
 	)
 }
@@ -173,6 +176,70 @@ func registerReferenceWorker(lc fx.Lifecycle, cfg config.Config, svc *app.WagerS
 	lc.Append(fx.Hook{OnStart: loop.Start, OnStop: loop.Stop})
 }
 
+// awsModule: cliente SQS, compartilhado pelo consumidor e pelo publicador da
+// outbox (só quando algum dos dois está ligado).
+func awsModule(cfg config.Config) fx.Option {
+	if !cfg.SQS.Enabled && !cfg.Outbox.Enabled {
+		return fx.Options()
+	}
+	return fx.Module("aws",
+		fx.Provide(func(cfg config.Config) (*sqs.Client, error) {
+			return sqsconsumer.NewClient(context.Background(), sqsconsumer.ClientConfig{
+				Region: cfg.SQS.Region, Endpoint: cfg.SQS.Endpoint,
+				AccessKeyID: cfg.SQS.AccessKeyID, SecretAccessKey: cfg.SQS.SecretAccessKey,
+			})
+		}),
+	)
+}
+
+// outboxModule: publicador da outbox (só quando OUTBOX_PUBLISHER_ENABLED).
+func outboxModule(cfg config.Config) fx.Option {
+	if !cfg.Outbox.Enabled {
+		return fx.Options()
+	}
+	return fx.Module("outbox", fx.Invoke(registerOutboxPublisher))
+}
+
+func registerOutboxPublisher(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, store app.Store,
+	clock app.Clock, log *slog.Logger) {
+	var eventsURL atomic.Pointer[string]
+	svc := app.NewOutboxService(store,
+		sqsconsumer.Publisher{API: client, QueueURL: func() string {
+			if p := eventsURL.Load(); p != nil {
+				return *p
+			}
+			return ""
+		}},
+		clock, app.OutboxConfig{
+			Owner: cfg.InstanceID, BatchSize: cfg.Outbox.BatchSize, Lease: cfg.Outbox.Lease,
+			RetryBase: cfg.Outbox.RetryBaseDelay, RetryMax: cfg.Outbox.RetryMaxDelay,
+		}, app.OutboxHooks{})
+
+	loop := worker.New(worker.Config{
+		Name: "outbox-publisher", Interval: cfg.Outbox.PollInterval,
+		// o lote inteiro precisa caber no arrendamento
+		ItemTimeout: cfg.Outbox.Lease,
+	}, log, func(ctx context.Context) (bool, error) {
+		res, err := svc.PublishBatch(ctx)
+		if res.Claimed > 0 {
+			log.Info("outbox batch", "claimed", res.Claimed, "published", res.Published, "failed", res.Failed)
+		}
+		return res.Claimed > 0, err
+	})
+	lc.Append(fx.Hook{
+		// valida a dependência na partida: a fila de eventos precisa existir
+		OnStart: func(ctx context.Context) error {
+			url, err := sqsconsumer.ResolveQueueURL(ctx, client, cfg.Outbox.Queue)
+			if err != nil {
+				return err
+			}
+			eventsURL.Store(&url)
+			return loop.Start(ctx)
+		},
+		OnStop: loop.Stop,
+	})
+}
+
 // sqsModule: consumidor da fila de entrada (só quando SQS_ENABLED).
 func sqsModule(cfg config.Config) fx.Option {
 	if !cfg.SQS.Enabled {
@@ -180,12 +247,6 @@ func sqsModule(cfg config.Config) fx.Option {
 	}
 	return fx.Module("sqs",
 		fx.Provide(
-			func(lc fx.Lifecycle, cfg config.Config) (*sqs.Client, error) {
-				return sqsconsumer.NewClient(context.Background(), sqsconsumer.ClientConfig{
-					Region: cfg.SQS.Region, Endpoint: cfg.SQS.Endpoint,
-					AccessKeyID: cfg.SQS.AccessKeyID, SecretAccessKey: cfg.SQS.SecretAccessKey,
-				})
-			},
 			func() *sqsQueues { return &sqsQueues{} },
 			fx.Annotate(
 				func(c *sqs.Client, q *sqsQueues) httpapi.Checker {

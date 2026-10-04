@@ -140,23 +140,55 @@ type DLQMessage struct {
 func (q *Queues) ReadDLQ(n int, timeout time.Duration) []DLQMessage {
 	q.t.Helper()
 	var out []DLQMessage
+	for _, m := range q.consume(q.DLQURL, n, timeout) {
+		out = append(out, DLQMessage{Body: m.Body, Reason: m.Attributes["failure-reason"]})
+	}
+	return out
+}
+
+// Received é uma mensagem lida de uma fila.
+type Received struct {
+	Body       string
+	GroupID    string
+	DedupID    string
+	Attributes map[string]string
+}
+
+// ReadQueue consome até n mensagens da fila principal, em ordem de entrega.
+func (q *Queues) ReadQueue(n int, timeout time.Duration) []Received {
+	q.t.Helper()
+	return q.consume(q.URL, n, timeout)
+}
+
+func (q *Queues) consume(url string, n int, timeout time.Duration) []Received {
+	q.t.Helper()
+	var out []Received
 	deadline := time.Now().Add(timeout)
 	for len(out) < n && time.Now().Before(deadline) {
 		res, err := q.Client.ReceiveMessage(context.Background(), &sqs.ReceiveMessageInput{
-			QueueUrl: aws.String(q.DLQURL), MaxNumberOfMessages: 10, WaitTimeSeconds: 1,
+			QueueUrl: aws.String(url), MaxNumberOfMessages: 10, WaitTimeSeconds: 1,
 			VisibilityTimeout: 30, MessageAttributeNames: []string{"All"},
+			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+				types.MessageSystemAttributeNameMessageGroupId,
+				types.MessageSystemAttributeNameMessageDeduplicationId,
+			},
 		})
 		if err != nil {
-			q.t.Fatalf("read dlq: %v", err)
+			q.t.Fatalf("receive %s: %v", url, err)
 		}
 		for _, m := range res.Messages {
-			reason := ""
-			if v, ok := m.MessageAttributes["failure-reason"]; ok {
-				reason = aws.ToString(v.StringValue)
+			r := Received{
+				Body:       aws.ToString(m.Body),
+				GroupID:    m.Attributes[string(types.MessageSystemAttributeNameMessageGroupId)],
+				DedupID:    m.Attributes[string(types.MessageSystemAttributeNameMessageDeduplicationId)],
+				Attributes: map[string]string{},
 			}
-			out = append(out, DLQMessage{Body: aws.ToString(m.Body), Reason: reason})
+			for k, v := range m.MessageAttributes {
+				r.Attributes[k] = aws.ToString(v.StringValue)
+			}
+			out = append(out, r)
 			_, _ = q.Client.DeleteMessage(context.Background(), &sqs.DeleteMessageInput{
-				QueueUrl: aws.String(q.DLQURL), ReceiptHandle: m.ReceiptHandle,
+				QueueUrl: aws.String(url), ReceiptHandle: m.ReceiptHandle,
 			})
 		}
 	}

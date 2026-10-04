@@ -101,9 +101,39 @@ type InboxRepository interface {
 	Complete(ctx context.Context, consumer, messageID string, now time.Time) error
 }
 
-// OutboxRepository grava eventos a publicar.
+// OutboxRepository grava eventos a publicar e controla a publicação.
 type OutboxRepository interface {
 	Append(ctx context.Context, records ...OutboxRecord) error
+
+	// Claim reivindica até limit eventos prontos para publicar, com um
+	// arrendamento (lease) até now+lease em nome de owner. Pega só o evento
+	// pendente mais antigo de cada agregado (ordem por agregado), pula os que
+	// outra instância já travou (SKIP LOCKED) e retoma arrendamentos vencidos
+	// (trabalho abandonado por uma instância que caiu).
+	Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]OutboxMessage, error)
+	// MarkPublished registra a publicação. Não faz nada se já estiver
+	// publicado (outra instância concluiu primeiro).
+	MarkPublished(ctx context.Context, eventID uuid.UUID, now time.Time) error
+	// MarkFailed libera o evento para nova tentativa em nextAttemptAt.
+	MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, nextAttemptAt time.Time, cause string) error
+}
+
+// OutboxMessage é um evento reivindicado para publicação.
+type OutboxMessage struct {
+	EventID       uuid.UUID
+	AggregateType string
+	AggregateID   uuid.UUID
+	EventType     string
+	EventVersion  int
+	CorrelationID string
+	Payload       []byte
+	OccurredAt    time.Time
+	Attempts      int // já contando esta tentativa
+}
+
+// EventPublisher entrega um evento ao destino externo (SQS).
+type EventPublisher interface {
+	Publish(ctx context.Context, m OutboxMessage) error
 }
 
 // OutboxRecord é um evento serializado pronto para a tabela outbox_events.

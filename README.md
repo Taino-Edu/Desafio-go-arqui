@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **8 — consumidor SQS com inbox e DLQ**.
+> 🚧 Em construção. Fase atual: **9 — publicador da outbox**.
 
 ## Documentação
 
@@ -97,6 +97,18 @@ docker compose exec localstack awslocal sqs receive-message --message-attribute-
   --queue-url http://localhost:4566/000000000000/wager-transactions-dlq.fifo
 ```
 
+Eventos publicados pela outbox (`WagerTransactionProcessed`, `WalletBalanceChanged`...):
+
+```sh
+docker compose exec localstack awslocal sqs receive-message --max-number-of-messages 10 \
+  --attribute-names MessageGroupId MessageDeduplicationId --message-attribute-names All \
+  --queue-url http://localhost:4566/000000000000/wallet-events.fifo
+
+# o que ainda falta publicar
+docker compose exec postgres psql -U wallet_owner -d wallet -c \
+  "SELECT event_type, attempts, last_error, next_attempt_at FROM outbox_events WHERE published_at IS NULL"
+```
+
 ### Rodar a API fora do Docker
 
 ```sh
@@ -127,6 +139,11 @@ DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=dis
 | `SQS_POLLERS` / `SQS_MAX_MESSAGES` / `SQS_WAIT_TIME` | `2` / `10` / `10s` | recebimento (long polling) |
 | `SQS_RETRY_BASE_DELAY` / `SQS_RETRY_MAX_DELAY` | `1s` / `1m` | backoff de visibilidade em falha transitória |
 | `SQS_ALLOWED_PROVIDERS` | — (qualquer) | provedores aceitos na fila, separados por vírgula |
+| `OUTBOX_PUBLISHER_ENABLED` | `true` | liga o publicador da outbox nesta instância |
+| `OUTBOX_QUEUE` | `wallet-events.fifo` | fila de eventos (nome ou URL); usa a conexão SQS acima |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_POLL_INTERVAL` | `50` / `500ms` | eventos por rodada; espera quando não há eventos |
+| `OUTBOX_LEASE` | `30s` | reserva de um evento reivindicado (recuperação de trabalho abandonado) |
+| `OUTBOX_RETRY_BASE_DELAY` / `OUTBOX_RETRY_MAX_DELAY` | `1s` / `5m` | backoff de falha de publicação |
 | `REFERENCE_WORKER_ENABLED` | `true` | liga o worker de referências pendentes nesta instância |
 | `REFERENCE_WORKER_INTERVAL` | `1s` | espera do worker quando não há pendência vencida |
 | `REFERENCE_RETRY_BASE_DELAY` / `REFERENCE_RETRY_MAX_DELAY` | `1s` / `5m` | backoff exponencial entre tentativas |
@@ -166,6 +183,9 @@ go test -tags=integration -race -run 'TestAuth' ./test/integration/
 
 # SQS: inbox, duplicatas, HTTP x SQS, DLQ, queda após o commit, shutdown (LocalStack real)
 go test -tags=integration -race -run 'TestSQS' ./test/integration/
+
+# outbox: só após o commit, publicadores concorrentes, ordem, quedas, backoff
+go test -tags=integration -race -run 'TestOutbox' ./test/integration/
 
 # só os testes de concorrência e de 3 instâncias (compila cmd/server e sobe 3 processos)
 go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeIndependentInstances' ./test/integration/
