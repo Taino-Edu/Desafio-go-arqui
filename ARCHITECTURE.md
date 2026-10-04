@@ -8,11 +8,11 @@ correspondente é implementada (ver o roteiro em
 |---|---|
 | [Organização dos pacotes](#organização-dos-pacotes) | ✅ |
 | [Dinheiro (`Money`)](#dinheiro-money) | ✅ |
-| Carteira, ledger e transações | ⏳ fase 2 |
+| [Carteira, ledger e transações](#carteira-ledger-e-transações) | ✅ |
 | Banco, migrations e transação SQL | ⏳ fase 3 |
 | Idempotência | ⏳ fase 5 |
 | Concorrência e locks | ⏳ fase 5 |
-| Reversões e referências pendentes | ⏳ fase 6 |
+| Reversões e referências pendentes | 🟡 regras de domínio na fase 2; worker e banco na fase 6 |
 | Autenticação e autorização | ⏳ fase 7 |
 | Inbox, SQS e DLQ | ⏳ fase 8 |
 | Outbox | ⏳ fase 9 |
@@ -96,3 +96,141 @@ Entradas financeiras externas devem passar por `Parse`.
 
 `Add`, `Sub` e `Cmp` entre moedas diferentes devolvem `ErrCurrencyMismatch`.
 `Equal` entre moedas diferentes devolve `false`.
+
+---
+
+## Carteira, ledger e transações
+
+Pacotes: [`wallet`](internal/domain/wallet), [`wagering`](internal/domain/wagering),
+[`events`](internal/domain/events), [`domainerr`](internal/domain/domainerr).
+Todos usam só a biblioteca padrão e `github.com/google/uuid`.
+
+### Princípios comuns
+
+- **Estado encapsulado:** campos privados, sem setters. Só construtores e
+  métodos de transição alteram o estado.
+- **Criação vs. reidratação:** `Open`/`NewExternal`/`NewOpening` criam e
+  podem emitir eventos; `Rehydrate` reconstrói a partir do banco, valida a
+  coerência do registro e **não** reaplica movimentos, não muda a versão nem
+  emite eventos.
+- **Eventos pendentes:** as entidades acumulam eventos; a camada de aplicação
+  os retira com `PullEvents()` e os grava na outbox na mesma transação SQL.
+- **Valor zero rejeitado:** `Wallet{}`, IDs nulos, `Money{}` e instantes
+  zerados devolvem erro.
+- **Erros classificáveis:** validação → `domainerr.ErrValidation` (`FieldError`
+  traz o campo); saldo → `wallet.ErrInsufficientFunds`; estado →
+  `wagering.ErrInvalidTransition` (`TransitionError` traz origem e destino).
+  Nenhuma rejeição de negócio usa `panic`.
+- **Tempo:** todo instante é recebido por parâmetro (`now`) e normalizado para
+  UTC, o que torna o domínio determinístico nos testes.
+
+### Wallet
+
+| Regra | Onde |
+|---|---|
+| versão inicial `1` | `Open` |
+| versão sobe só quando o saldo muda | `move`: `LOSS` e rejeições não alteram a versão |
+| saldo nunca negativo | `Debit` devolve `ErrInsufficientFunds` sem alterar nada |
+| moeda do movimento = moeda da carteira | `move` devolve `money.ErrCurrencyMismatch` |
+| todo movimento gera `LedgerEntry` + `WalletBalanceChanged` | `move` / `record` |
+| saldo inicial positivo gera crédito de abertura; zero não gera | `Open` |
+
+A unicidade `(playerId, currency)`, o `CHECK (balance >= 0)` e o bloqueio de
+concorrência ficam no banco (fases 3 e 5); o domínio é a primeira barreira,
+não a única.
+
+### LedgerEntry
+
+Imutável. O construtor valida `balanceAfter = balanceBefore ± amount` conforme
+a direção, valor positivo, saldos não negativos e moedas iguais. Como não há
+transições, o mesmo construtor serve para criação e reidratação.
+
+### WagerTransaction: máquina de estados
+
+```
+PENDING ───────────► PROCESSED | REJECTED | FAILED | PENDING_REFERENCE
+PENDING_REFERENCE ─► PROCESSED | REJECTED | FAILED
+PROCESSED, REJECTED, FAILED: terminais
+```
+
+- `PENDING_REFERENCE` vai direto para o desfecho quando a referência é
+  resolvida; não volta para `PENDING`.
+- `RescheduleReference` só conta tentativas e reagenda; não é uma transição.
+- `OPENING` nasce interna e já `PROCESSED`, sem metadados externos.
+- `MarkFailed` registra falha permanente (`PERMANENT_PROCESSING_ERROR`) para
+  auditoria, sem evento de negócio.
+- **Transitória vs. permanente:** falha transitória (banco fora, timeout,
+  deadlock) não muda o estado: a operação é tentada de novo. Só falhas que
+  nunca vão se resolver levam a `FAILED`.
+
+### Regras por tipo (`wagering.Apply`)
+
+| Tipo | Valor | Referência | Movimento |
+|---|---|---|---|
+| `BET` | > 0 | proibida | débito |
+| `WIN` | > 0 | opcional; precisa ser `BET` | crédito |
+| `LOSS` | exatamente `0.00` | proibida | nenhum; só `WagerTransactionProcessed` |
+| `REFUND` | > 0 e = valor da `BET` | obrigatória; `BET` | crédito |
+| `ROLLBACK` | > 0 e = valor original | obrigatória; `BET`, `WIN` ou `REFUND` | contrário do original |
+
+Erros de formato e de regra de valor/referência acima são **validação**
+(`ErrValidation`, HTTP 400, nada é persistido). As condições que dependem do
+estado são **rejeições** persistidas (`REJECTED` + `failureCode`):
+
+| `failureCode` | Tipo | Quando |
+|---|---|---|
+| `INSUFFICIENT_FUNDS` | definitivo | débito de `BET` sem saldo |
+| `REVERSAL_INSUFFICIENT_FUNDS` | definitivo | débito de `ROLLBACK` sem saldo |
+| `REFERENCE_NOT_FOUND` | definitivo | referência não chegou até esgotar as tentativas |
+| `REFERENCE_NOT_PROCESSED` | definitivo | referência terminou `REJECTED`/`FAILED` |
+| `ALREADY_REVERSED` | definitivo | referência já revertida (detectado pelo índice único no banco) |
+| `WALLET_NOT_FOUND` | corrigível | carteira inexistente |
+| `WALLET_PLAYER_MISMATCH` | corrigível | `playerId` não é o dono de `walletId` |
+| `CURRENCY_MISMATCH` | corrigível | moeda diferente da carteira |
+| `REFERENCE_MISMATCH` | corrigível | provedor, jogador, carteira, moeda ou rodada diferentes |
+| `REFERENCE_KIND_INVALID` | corrigível | tipo referenciado não permitido (ex.: `ROLLBACK` de `ROLLBACK`) |
+| `AMOUNT_MISMATCH` | corrigível | valor da reversão diferente do original |
+
+`FailureCode.IsCorrectable()` expõe essa classificação.
+
+### Referências
+
+`Apply` confere primeiro as divergências estáticas (tipo, provedor, jogador,
+carteira, moeda, rodada, valor), que não mudam com o tempo, e só depois o
+estado da referência:
+
+| Estado da referência | Resultado |
+|---|---|
+| não encontrada | `AWAITING_REFERENCE` (transação não muda) |
+| `PENDING` / `PENDING_REFERENCE` | `AWAITING_REFERENCE` (espera mais um ciclo) |
+| `PROCESSED` | aplica |
+| `REJECTED` / `FAILED` | rejeita com `REFERENCE_NOT_PROCESSED` |
+
+Diante de `AWAITING_REFERENCE`, a aplicação chama `MarkPendingReference`
+(primeira vez), `RescheduleReference` (tentativas seguintes) ou
+`MarkRejected(REFERENCE_NOT_FOUND)` quando `ReferenceRetryPolicy.Exhausted`.
+
+Backoff: `min(1s × 2^n, 5min)`, até 12 tentativas (cerca de 24 minutos). O
+jitter é somado pelo worker, para manter a política determinística.
+
+### Combinações de REFUND e ROLLBACK
+
+Política (a imposição definitiva é um índice único parcial no banco, fase 6):
+
+1. Uma `BET` recebe **no máximo uma** compensação direta: `REFUND` **ou**
+   `ROLLBACK`.
+2. Um `WIN` ou `REFUND` recebe no máximo um `ROLLBACK`.
+3. `ROLLBACK` de `ROLLBACK` é recusado (`REFERENCE_KIND_INVALID`).
+
+Assim o mesmo débito nunca é devolvido duas vezes: `BET → REFUND → ROLLBACK
+do REFUND` termina com o débito original de volta, e um novo `REFUND` da mesma
+`BET` é bloqueado.
+
+### Eventos
+
+Um tipo concreto por evento; o construtor fixa `eventType` e `version`. O
+envelope (`eventId`, `eventType`, `aggregateId`, `correlationId`,
+`causationId`, `occurredAt`, `version`, `data`) é montado por
+`events.NewEnvelope`, que copia tipo, versão, agregado e instante do evento.
+Instantes em UTC (RFC 3339), dinheiro como string decimal, e o payload é um
+snapshot (os metadados externos são copiados).

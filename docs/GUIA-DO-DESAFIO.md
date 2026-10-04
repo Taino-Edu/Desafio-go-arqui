@@ -349,7 +349,7 @@ uma vez**.
       │          │
       │          └──────────────► FAILED      (terminal, infra permanente, auditoria)
       ▼
- PENDING_REFERENCE ──(referência chegou)──► PENDING ──► ...
+ PENDING_REFERENCE ──(referência chegou)──► PROCESSED | REJECTED | FAILED
       │
       └──(esgotou tentativas/TTL)──► REJECTED (REFERENCE_NOT_FOUND)
 ```

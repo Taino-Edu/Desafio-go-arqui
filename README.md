@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **1 — fundação e `Money`**.
+> 🚧 Em construção. Fase atual: **2 — modelo de domínio** (`Wallet`, `LedgerEntry`, `WagerTransaction`, eventos).
 
 ## Documentação
 
@@ -33,6 +33,11 @@ go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ## Estrutura
 
 ```
-internal/domain/money/   value object Money (centavos em int64, sem float)
+internal/domain/
+  money/       value object Money (centavos em int64, sem float)
+  wallet/      carteira (raiz do agregado) e lançamento de ledger
+  wagering/    transação de aposta, máquina de estados e regras dos 5 tipos
+  events/      eventos de integração e envelope
+  domainerr/   erros de validação compartilhados
 docs/                    material de estudo
 ```
