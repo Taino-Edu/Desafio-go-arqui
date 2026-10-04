@@ -78,7 +78,7 @@ func Open(p OpenParams) (*Wallet, *LedgerEntry, error) {
 	zero, _ := money.Zero(w.currency)
 	entry, err := NewLedgerEntry(LedgerEntryParams{
 		ID: p.LedgerEntryID, WalletID: w.id, TransactionID: p.OpeningTransactionID,
-		Direction: Credit, Amount: p.InitialBalance,
+		WalletVersion: InitialVersion, Direction: Credit, Amount: p.InitialBalance,
 		BalanceBefore: zero, BalanceAfter: p.InitialBalance, CreatedAt: now,
 	})
 	if err != nil {
@@ -170,7 +170,7 @@ func (w *Wallet) move(dir Direction, entryID, txID uuid.UUID, amount money.Money
 
 	now = now.UTC()
 	entry, err := NewLedgerEntry(LedgerEntryParams{
-		ID: entryID, WalletID: w.id, TransactionID: txID, Direction: dir,
+		ID: entryID, WalletID: w.id, TransactionID: txID, WalletVersion: w.version + 1, Direction: dir,
 		Amount: amount, BalanceBefore: w.balance, BalanceAfter: after, CreatedAt: now,
 	})
 	if err != nil {

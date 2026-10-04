@@ -4,7 +4,9 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **3 — infraestrutura local e schema do banco**.
+> 🚧 Em construção. Fase atual: **4 — API de carteiras com Uber Fx**.
+>
+> ⚠️ Autenticação ainda não está ligada nos endpoints (fase 7).
 
 ## Documentação
 
@@ -22,17 +24,55 @@ um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 ## Ambiente local
 
 ```sh
-cp .env.example .env        # opcional: só para mudar portas
-docker compose up -d        # Postgres + migrations + LocalStack (SQS) + Keycloak
-docker compose ps           # aguarde postgres, localstack e keycloak "healthy"
-docker compose down -v      # derruba e apaga os dados
+cp .env.example .env              # opcional: só para mudar portas
+docker compose up -d --build      # Postgres + migrations + LocalStack + Keycloak + API
+docker compose ps                 # aguarde os serviços "healthy"
+docker compose down -v            # derruba e apaga os dados
 ```
+
+> Atrás de um proxy que inspeciona TLS, o `go mod download` do build pode
+> falhar com `x509: certificate signed by unknown authority`. Informe o bundle
+> de CAs do proxy: `EXTRA_CA_CERT=/caminho/ca.crt docker compose up -d --build`.
 
 | Serviço | Endereço | Credenciais (só local) |
 |---|---|---|
 | PostgreSQL | `localhost:5432/wallet` | app `wallet_app/wallet_app`, migrations `wallet_owner/wallet_owner` |
 | LocalStack (SQS) | `http://localhost:4566` | `test/test` |
 | Keycloak | `http://localhost:8081` | admin `admin/admin`; realm `wallet` |
+| API | `http://localhost:8080` | (autenticação na fase 7) |
+
+### Exemplos
+
+```sh
+# abrir carteira
+curl -s -X POST localhost:8080/wallets -H 'Content-Type: application/json' -d '{
+  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1",
+  "initialBalance": {"amount": "1000.00", "currency": "BRL"}
+}'
+
+curl -s localhost:8080/wallets/<walletId>
+curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50'
+curl -s localhost:8080/health/ready
+```
+
+### Rodar a API fora do Docker
+
+```sh
+docker compose up -d postgres migrate
+DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=disable' \
+  HTTP_ADDR=:8080 go run ./cmd/server
+```
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `DATABASE_URL` | — (obrigatória) | conexão com o papel `wallet_app` |
+| `HTTP_ADDR` | `:8080` | endereço do servidor |
+| `INSTANCE_ID` | hostname | identifica a instância nos logs |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `DB_MAX_CONNS` | `20` | conexões do pool |
+| `DB_STATEMENT_TIMEOUT` / `DB_LOCK_TIMEOUT` | `5s` / `3s` | limites por comando e por espera de lock |
+| `HTTP_REQUEST_TIMEOUT` | `10s` | prazo de cada requisição |
+| `START_TIMEOUT` / `SHUTDOWN_TIMEOUT` | `30s` / `25s` | prazos de partida e de desligamento gracioso |
 
 Obter um token de teste (fluxo `client_credentials`):
 
@@ -78,6 +118,7 @@ go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ## Estrutura
 
 ```
+cmd/server/                  API HTTP (Uber Fx)
 cmd/migrate/                 aplica/reverte migrations
 internal/domain/
   money/                     value object Money (centavos em int64, sem float)
@@ -85,7 +126,11 @@ internal/domain/
   wagering/                  transação de aposta, máquina de estados e regras dos 5 tipos
   events/                    eventos de integração e envelope
   domainerr/                 erros de validação compartilhados
-internal/adapters/postgres/  migrations (pgx + golang-migrate) e testes do schema
+internal/app/                casos de uso e portas (interfaces)
+internal/adapters/postgres/  repositórios pgx, transação (Store), migrations
+internal/adapters/httpapi/   rotas, middlewares, erros, health
+internal/platform/config/    configuração por variáveis de ambiente
+internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
 internal/testsupport/pgtest/ banco descartável para testes de integração
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak

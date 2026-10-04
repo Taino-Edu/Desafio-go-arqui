@@ -33,6 +33,7 @@ type LedgerEntry struct {
 	id            uuid.UUID
 	walletID      uuid.UUID
 	transactionID uuid.UUID
+	walletVersion int64
 	direction     Direction
 	amount        money.Money
 	balanceBefore money.Money
@@ -45,6 +46,9 @@ type LedgerEntryParams struct {
 	ID            uuid.UUID
 	WalletID      uuid.UUID
 	TransactionID uuid.UUID
+	// WalletVersion é a versão da carteira produzida por este lançamento.
+	// Ordena o ledger e encadeia os lançamentos.
+	WalletVersion int64
 	Direction     Direction
 	Amount        money.Money
 	BalanceBefore money.Money
@@ -67,6 +71,8 @@ func NewLedgerEntry(p LedgerEntryParams) (LedgerEntry, error) {
 		return LedgerEntry{}, domainerr.Field("walletId", "required")
 	case p.TransactionID == uuid.Nil:
 		return LedgerEntry{}, domainerr.Field("transactionId", "required")
+	case p.WalletVersion < 1:
+		return LedgerEntry{}, domainerr.Field("walletVersion", "must be >= 1")
 	case !p.Direction.valid():
 		return LedgerEntry{}, domainerr.Field("direction", "must be DEBIT or CREDIT")
 	case !p.Amount.IsPositive():
@@ -95,7 +101,7 @@ func NewLedgerEntry(p LedgerEntryParams) (LedgerEntry, error) {
 
 	return LedgerEntry{
 		id: p.ID, walletID: p.WalletID, transactionID: p.TransactionID,
-		direction: p.Direction, amount: p.Amount,
+		walletVersion: p.WalletVersion, direction: p.Direction, amount: p.Amount,
 		balanceBefore: p.BalanceBefore, balanceAfter: p.BalanceAfter,
 		createdAt: p.CreatedAt.UTC(),
 	}, nil
@@ -104,6 +110,7 @@ func NewLedgerEntry(p LedgerEntryParams) (LedgerEntry, error) {
 func (e LedgerEntry) ID() uuid.UUID              { return e.id }
 func (e LedgerEntry) WalletID() uuid.UUID        { return e.walletID }
 func (e LedgerEntry) TransactionID() uuid.UUID   { return e.transactionID }
+func (e LedgerEntry) WalletVersion() int64       { return e.walletVersion }
 func (e LedgerEntry) Direction() Direction       { return e.direction }
 func (e LedgerEntry) Amount() money.Money        { return e.amount }
 func (e LedgerEntry) BalanceBefore() money.Money { return e.balanceBefore }

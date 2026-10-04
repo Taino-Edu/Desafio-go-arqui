@@ -55,7 +55,7 @@ func TestOpen_PositiveBalance(t *testing.T) {
 	if entry == nil {
 		t.Fatal("abertura com saldo positivo deve gerar lançamento")
 	}
-	if entry.Direction() != wallet.Credit || entry.TransactionID() != txID ||
+	if entry.Direction() != wallet.Credit || entry.TransactionID() != txID || entry.WalletVersion() != 1 ||
 		entry.BalanceBefore().Amount() != "0.00" || entry.BalanceAfter().Amount() != "1000.00" {
 		t.Errorf("entry = %+v", entry)
 	}
@@ -125,7 +125,7 @@ func TestDebitCredit(t *testing.T) {
 	if w.Balance().Amount() != "20.00" || w.Version() != 2 {
 		t.Errorf("após débito: %v v%d", w.Balance(), w.Version())
 	}
-	if e.BalanceBefore().Amount() != "100.00" || e.BalanceAfter().Amount() != "20.00" || e.Direction() != wallet.Debit {
+	if e.BalanceBefore().Amount() != "100.00" || e.BalanceAfter().Amount() != "20.00" || e.Direction() != wallet.Debit || e.WalletVersion() != 2 {
 		t.Errorf("entry = %+v", e)
 	}
 
@@ -231,7 +231,7 @@ func TestRehydrate(t *testing.T) {
 
 func TestNewLedgerEntry(t *testing.T) {
 	base := wallet.LedgerEntryParams{
-		ID: uuid.New(), WalletID: uuid.New(), TransactionID: uuid.New(),
+		ID: uuid.New(), WalletID: uuid.New(), TransactionID: uuid.New(), WalletVersion: 2,
 		Direction: wallet.Debit, Amount: brl(t, "25.00"),
 		BalanceBefore: brl(t, "100.00"), BalanceAfter: brl(t, "75.00"), CreatedAt: t0,
 	}
@@ -256,6 +256,7 @@ func TestNewLedgerEntry(t *testing.T) {
 		},
 		"sem transação":   func(p *wallet.LedgerEntryParams) { p.TransactionID = uuid.Nil },
 		"sem instante":    func(p *wallet.LedgerEntryParams) { p.CreatedAt = time.Time{} },
+		"versão zero":     func(p *wallet.LedgerEntryParams) { p.WalletVersion = 0 },
 		"moeda diferente": func(p *wallet.LedgerEntryParams) { p.Amount = usd },
 	}
 	for name, mutate := range bad {

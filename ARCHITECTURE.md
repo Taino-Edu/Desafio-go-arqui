@@ -9,14 +9,16 @@ correspondente é implementada (ver o roteiro em
 | [Organização dos pacotes](#organização-dos-pacotes) | ✅ |
 | [Dinheiro (`Money`)](#dinheiro-money) | ✅ |
 | [Carteira, ledger e transações](#carteira-ledger-e-transações) | ✅ |
-| [Banco, migrations e invariantes no schema](#banco-migrations-e-invariantes-no-schema) | ✅ (transação SQL entre repositórios: fase 4) |
+| [Banco, migrations e invariantes no schema](#banco-migrations-e-invariantes-no-schema) | ✅ |
+| [Transação SQL entre repositórios](#transação-sql-entre-repositórios) | ✅ |
+| [Contrato HTTP](#contrato-http) | 🟡 carteiras e health; operações na fase 5 |
 | Idempotência | ⏳ fase 5 |
 | Concorrência e locks | ⏳ fase 5 |
 | Reversões e referências pendentes | 🟡 regras de domínio na fase 2; worker e banco na fase 6 |
 | Autenticação e autorização | 🟡 Keycloak provisionado na fase 3; validação na fase 7 |
 | Inbox, SQS e DLQ | ⏳ fase 8 |
 | Outbox | ⏳ fase 9 |
-| Uber Fx e shutdown | ⏳ fase 4+ |
+| [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP e banco; workers entram nas fases 6, 8 e 9 |
 | Observabilidade | ⏳ fase 10 |
 
 ---
@@ -24,14 +26,17 @@ correspondente é implementada (ver o roteiro em
 ## Organização dos pacotes
 
 ```
-internal/domain/   regras de negócio puras: só stdlib, sem Fx, HTTP, SQS ou pgx
-internal/app/      casos de uso (orquestram domínio + interfaces de persistência)
-internal/adapters/ postgres, http, sqs, auth, observabilidade
-cmd/server/        composição com Uber Fx
+internal/domain/         regras de negócio puras: stdlib + uuid
+internal/app/            casos de uso; define as portas (interfaces) de persistência
+internal/adapters/       implementações: postgres (pgx), httpapi (net/http); sqs e auth virão
+internal/platform/       config (variáveis de ambiente) e fxapp (composição Uber Fx)
+cmd/server, cmd/migrate  executáveis
 ```
 
-O domínio não importa nenhuma biblioteca de infraestrutura. Isso permite
-testá-lo sem banco e trocar adaptadores sem tocar nas regras.
+Dependências apontam para dentro: `adapters → app → domain`. O domínio não
+importa infraestrutura; `app` não importa pgx, HTTP nem Fx; **só `fxapp`
+importa Fx**. Isso permite testar o domínio sem banco e trocar adaptadores
+sem tocar nas regras.
 
 ---
 
@@ -326,3 +331,121 @@ O emissor do Keycloak é fixo (`KC_HOSTNAME`), então tokens obtidos de fora
 cria um banco descartável (`pgtest.New`), aplica as migrations como
 `wallet_owner` e usa `wallet_app`, como a aplicação. Cada teste tenta violar
 uma invariante e confere o `SQLSTATE` devolvido.
+
+---
+
+## Transação SQL entre repositórios
+
+Arquivos: [`internal/app/ports.go`](internal/app/ports.go),
+[`internal/adapters/postgres/store.go`](internal/adapters/postgres/store.go).
+
+A camada de aplicação define a porta `Store`:
+
+```go
+store.WithinTx(ctx, func(ctx context.Context, r app.Repositories) error {
+    r.Wallets().Insert(...)       // todos estes repositórios
+    r.Transactions().Insert(...)  // compartilham a MESMA pgx.Tx
+    r.Ledger().Insert(...)
+    return r.Outbox().Append(...) // erro em qualquer passo => ROLLBACK de tudo
+})
+```
+
+- A implementação abre `BEGIN` (READ COMMITTED), entrega repositórios
+  construídos sobre a mesma `pgx.Tx` e faz `COMMIT` no fim. Se `fn` falhar ou o
+  `COMMIT` falhar (por exemplo, a checagem adiada saldo = ledger), tudo é
+  desfeito. O rollback usa um contexto próprio, porque o da requisição pode já
+  ter expirado.
+- `Reader()` devolve repositórios sobre o pool, para consultas.
+- Os repositórios recebem uma interface `querier` (o que `pgxpool.Pool` e
+  `pgx.Tx` têm em comum), então o mesmo código serve dentro e fora de
+  transação.
+
+### Proteção contra lost update (duas camadas no Go, uma no banco)
+
+1. `GetForUpdate`: `SELECT ... FOR UPDATE` trava só a linha da carteira.
+2. `Update`: `UPDATE ... WHERE id = $1 AND version = $nova - 1`. Se outro
+   escritor confirmou antes, nenhuma linha muda e o caso de uso recebe
+   `ErrTransient` em vez de sobrescrever.
+3. No banco, o trigger de versão e a checagem adiada saldo = ledger.
+
+Testado em `TestStore_UpdateRejectsStaleVersion`: com a condição de versão
+removida do Go, o trigger do banco ainda barra a escrita.
+
+### Falhas transitórias
+
+`postgres.classify` embrulha com `app.ErrTransient`: SQLSTATE `40001`
+(serialização), `40P01` (deadlock), `55P03` (`lock_timeout`), `57014`
+(`statement_timeout`), `57P0x`, `53300`, classe `08` (conexão), erros de rede
+e prazo do contexto. O HTTP responde `503` com `Retry-After`. O pool define
+`statement_timeout` (5s) e `lock_timeout` (3s) por conexão, menores que o prazo
+da requisição (10s), para que esperar por uma carteira disputada nunca segure
+uma requisição indefinidamente.
+
+---
+
+## Uber Fx: ciclo de vida e shutdown
+
+Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
+
+| Módulo (`fx.Module`) | Fornece (`fx.Provide`) | Ciclo de vida (`fx.Lifecycle`) |
+|---|---|---|
+| `logging` | `*slog.Logger` JSON | — |
+| `postgres` | `*pgxpool.Pool`, `app.Store` | OnStart: ping (sem banco, não sobe). OnStop: fecha o pool |
+| `app` | `Clock`, `IDGenerator`, `WalletService` | — |
+| `http` | `Health`, handler, `*httpapi.Server` | `fx.Invoke` registra OnStart (abre a porta) e OnStop (shutdown gracioso) |
+
+- **Partida:** `cmd/server` valida a configuração antes do Fx (inválida → sai
+  com código 2). O Fx executa os OnStart em ordem: banco, depois HTTP; cada um
+  dentro de `START_TIMEOUT`.
+- **Parada (SIGTERM):** o Fx executa os OnStop em ordem **inversa**, dentro de
+  `SHUTDOWN_TIMEOUT`:
+  1. HTTP: o readiness passa a `503 draining`, o servidor para de aceitar
+     conexões e espera as requisições em andamento (`http.Server.Shutdown`);
+     se o prazo estourar, fecha as conexões restantes.
+  2. Banco: o pool fecha **depois** que ninguém mais o usa.
+- `HTTP_REQUEST_TIMEOUT < SHUTDOWN_TIMEOUT` é validado na configuração, para
+  que uma requisição em andamento sempre caiba no prazo de desligamento.
+- `docker-compose` usa `stop_grace_period: 30s` (maior que `SHUTDOWN_TIMEOUT`).
+
+Testes (`fxapp_integration_test.go`): `fx.ValidateApp` confere o grafo;
+`fxtest` sobe a aplicação com banco real, usa a API, desliga e confirma que a
+porta foi liberada e o pool fechado; outro teste confirma que sem banco a
+aplicação não inicia.
+
+---
+
+## Contrato HTTP
+
+Respostas de erro têm sempre o formato:
+
+```json
+{"error": {"code": "INVALID_REQUEST", "message": "...", "field": "initialBalance.amount"}}
+```
+
+| Situação | Status | `error.code` |
+|---|---|---|
+| JSON malformado, campo desconhecido, tipo errado, valor fora do formato, UUID inválido, cursor inválido | `400` | `INVALID_REQUEST` |
+| carteira inexistente | `404` | `NOT_FOUND` |
+| carteira já existe para jogador e moeda | `409` | `WALLET_ALREADY_EXISTS` |
+| indisponibilidade transitória (banco, lock, timeout) | `503` + `Retry-After: 1` | `TEMPORARILY_UNAVAILABLE` |
+| erro inesperado (detalhes só no log) | `500` | `INTERNAL_ERROR` |
+
+Rejeição de negócio, conflito de idempotência e processamento pendente entram
+na fase 5.
+
+| Endpoint | Sucesso |
+|---|---|
+| `POST /wallets` | `201` + `Location`; corpo com `id`, `playerId`, `balance`, `version` |
+| `GET /wallets/{walletId}` | `200` |
+| `GET /wallets/{walletId}/ledger?cursor=&limit=` | `200` `{walletId, items[], nextCursor}`; `limit` de 1 a 200 (padrão 50) |
+| `GET /health/live` | `200` sempre que o processo responde |
+| `GET /health/ready` | `200` com Postgres ok; `503` se indisponível ou desligando |
+
+- **Paginação:** ordem crescente de `walletVersion` (estável: lançamentos novos
+  só entram no fim). O cursor é opaco (`base64url("v1:<versão>")`).
+- **Correlação:** `X-Correlation-Id` recebido (validado) ou gerado; volta no
+  cabeçalho da resposta, vai para os logs e para o `correlationId` dos eventos.
+- **Instantes:** UTC, truncados em microssegundos (a precisão do Postgres), para
+  que o valor devolvido na criação seja igual ao lido depois.
+
+> Autenticação ainda não está ligada: entra na fase 7, antes da entrega.
