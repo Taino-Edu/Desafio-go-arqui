@@ -24,6 +24,7 @@ import (
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/httpapi"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/postgres"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/config"
 )
 
@@ -94,6 +95,9 @@ var AppModule = fx.Module("app",
 		func() app.Clock { return app.SystemClock{} },
 		func() app.IDGenerator { return app.UUIDv7{} },
 		app.NewWalletService,
+		func(store app.Store, clock app.Clock, ids app.IDGenerator) *app.WagerService {
+			return app.NewWagerService(store, clock, ids, wagering.DefaultReferenceRetryPolicy)
+		},
 	),
 )
 

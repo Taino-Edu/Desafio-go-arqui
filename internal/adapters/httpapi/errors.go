@@ -16,6 +16,8 @@ const (
 	CodeInvalidRequest         = "INVALID_REQUEST"
 	CodeNotFound               = "NOT_FOUND"
 	CodeWalletAlreadyExists    = "WALLET_ALREADY_EXISTS"
+	CodeIdempotencyKeyReused   = "IDEMPOTENCY_KEY_REUSED"
+	CodeDuplicateTransaction   = "DUPLICATE_TRANSACTION"
 	CodeTemporarilyUnavailable = "TEMPORARILY_UNAVAILABLE"
 	CodeInternal               = "INTERNAL_ERROR"
 )
@@ -61,6 +63,12 @@ func classifyError(err error) (int, ErrorBody) {
 		return http.StatusBadRequest, errBody(CodeInvalidRequest, err.Error(), "")
 	case errors.Is(err, app.ErrWalletNotFound):
 		return http.StatusNotFound, errBody(CodeNotFound, "wallet not found", "")
+	case errors.Is(err, app.ErrTransactionNotFound):
+		return http.StatusNotFound, errBody(CodeNotFound, "transaction not found", "")
+	case errors.Is(err, app.ErrIdempotencyKeyReused):
+		return http.StatusConflict, errBody(CodeIdempotencyKeyReused, err.Error(), "")
+	case errors.Is(err, app.ErrDuplicateTransaction):
+		return http.StatusConflict, errBody(CodeDuplicateTransaction, err.Error(), "")
 	case errors.Is(err, app.ErrWalletAlreadyExists):
 		return http.StatusConflict, errBody(CodeWalletAlreadyExists, err.Error(), "")
 	case errors.Is(err, app.ErrTransient), errors.Is(err, context.DeadlineExceeded):

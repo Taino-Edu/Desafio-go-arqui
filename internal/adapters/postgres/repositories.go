@@ -224,3 +224,173 @@ func (r outboxRepo) Append(ctx context.Context, records ...app.OutboxRecord) err
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------
+// wager_transactions: idempotência, leitura e mudança de estado
+// ---------------------------------------------------------------------
+
+const txColumns = `
+	id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
+	provider_id, external_transaction_id, idempotency_key, payload_hash,
+	round_id, game_id, reference_external_transaction_id, reference_transaction_id,
+	failure_code, balance_after_minor, attempts, next_attempt_at, created_at, updated_at`
+
+// InsertIfAbsent usa ON CONFLICT DO NOTHING sobre os índices únicos
+// (provedor, chave) e (provedor, id externo). Se a linha conflitante pertence
+// a uma transação ainda aberta, o Postgres ESPERA ela terminar: se ela
+// confirmar, este INSERT não faz nada; se ela for desfeita, este INSERT
+// acontece. É isso que serializa requisições duplicadas simultâneas.
+func (r transactionRepo) InsertIfAbsent(ctx context.Context, t *wagering.WagerTransaction) (bool, error) {
+	ext := t.External()
+	if ext == nil {
+		return false, fmt.Errorf("InsertIfAbsent requires an external transaction")
+	}
+	var refExt *string
+	if ext.HasReference() {
+		refExt = &ext.ReferenceExternalTransactionID
+	}
+	tag, err := r.q.Exec(ctx, `
+		INSERT INTO wager_transactions (
+			id, origin, kind, status, wallet_id, player_id, amount_minor, currency,
+			provider_id, external_transaction_id, idempotency_key, payload_hash,
+			round_id, game_id, reference_external_transaction_id, attempts, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		ON CONFLICT DO NOTHING`,
+		t.ID(), string(t.Origin()), string(t.Kind()), string(t.Status()), t.WalletID(), t.PlayerID(),
+		t.Amount().MinorUnits(), t.Amount().Currency().Code(),
+		ext.ProviderID, ext.ExternalTransactionID, ext.IdempotencyKey, ext.PayloadHash,
+		ext.RoundID, ext.GameID, refExt, t.Attempts(), t.CreatedAt(), t.UpdatedAt())
+	if err != nil {
+		return false, classify(err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r transactionRepo) FindExisting(ctx context.Context, providerID, key, externalID string) (*wagering.WagerTransaction, error) {
+	t, err := scanTransaction(r.q.QueryRow(ctx, `SELECT `+txColumns+`
+		  FROM wager_transactions
+		 WHERE provider_id = $1 AND (idempotency_key = $2 OR external_transaction_id = $3)
+		 ORDER BY (idempotency_key = $2) DESC
+		 LIMIT 1`, providerID, key, externalID))
+	if errors.Is(err, app.ErrTransactionNotFound) {
+		return nil, nil
+	}
+	return t, err
+}
+
+func (r transactionRepo) GetByID(ctx context.Context, id uuid.UUID) (*wagering.WagerTransaction, error) {
+	return scanTransaction(r.q.QueryRow(ctx, `SELECT `+txColumns+` FROM wager_transactions WHERE id = $1`, id))
+}
+
+func (r transactionRepo) GetByExternalID(ctx context.Context, providerID, externalID string) (*wagering.WagerTransaction, error) {
+	return scanTransaction(r.q.QueryRow(ctx, `SELECT `+txColumns+`
+		  FROM wager_transactions WHERE provider_id = $1 AND external_transaction_id = $2`, providerID, externalID))
+}
+
+// Update grava o desfecho. O trigger do banco recusa transições inválidas e
+// qualquer mudança em estado terminal.
+func (r transactionRepo) Update(ctx context.Context, t *wagering.WagerTransaction) error {
+	var refID *uuid.UUID
+	if id, ok := t.ReferenceTransactionID(); ok {
+		refID = &id
+	}
+	var failure *string
+	if fc := t.FailureCode(); fc != "" {
+		s := string(fc)
+		failure = &s
+	}
+	var balanceAfter *int64
+	if b, ok := t.BalanceAfter(); ok {
+		v := b.MinorUnits()
+		balanceAfter = &v
+	}
+	var next *time.Time
+	if n, ok := t.NextAttemptAt(); ok {
+		next = &n
+	}
+	tag, err := r.q.Exec(ctx, `
+		UPDATE wager_transactions
+		   SET status = $2, failure_code = $3, balance_after_minor = $4, reference_transaction_id = $5,
+		       attempts = $6, next_attempt_at = $7, updated_at = $8
+		 WHERE id = $1`,
+		t.ID(), string(t.Status()), failure, balanceAfter, refID, t.Attempts(), next, t.UpdatedAt())
+	if c, ok := uniqueViolation(err); ok && c == "wager_tx_one_reversal_per_reference" {
+		// outra reversão da mesma referência confirmou antes: a nova tentativa
+		// verá a reversão existente e rejeitará com ALREADY_REVERSED
+		return fmt.Errorf("%w: reference reversed concurrently", app.ErrTransient)
+	}
+	if err != nil {
+		return classify(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return app.ErrTransactionNotFound
+	}
+	return nil
+}
+
+func (r transactionRepo) HasProcessedReversal(ctx context.Context, referenceID uuid.UUID) (bool, error) {
+	var exists bool
+	err := r.q.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM wager_transactions
+			 WHERE reference_transaction_id = $1
+			   AND kind IN ('REFUND', 'ROLLBACK') AND status = 'PROCESSED')`, referenceID).Scan(&exists)
+	return exists, classify(err)
+}
+
+func scanTransaction(row pgx.Row) (*wagering.WagerTransaction, error) {
+	var (
+		id, walletID, playerID                  uuid.UUID
+		origin, kind, status, currency          string
+		amount                                  int64
+		provider, extID, key, hash, round, game *string
+		refExt, failure                         *string
+		refID                                   *uuid.UUID
+		balanceAfter                            *int64
+		attempts                                int
+		next                                    *time.Time
+		created, updated                        time.Time
+	)
+	err := row.Scan(&id, &origin, &kind, &status, &walletID, &playerID, &amount, &currency,
+		&provider, &extID, &key, &hash, &round, &game, &refExt, &refID,
+		&failure, &balanceAfter, &attempts, &next, &created, &updated)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, app.ErrTransactionNotFound
+	}
+	if err != nil {
+		return nil, classify(err)
+	}
+
+	cur, err := money.NewCurrency(currency)
+	if err != nil {
+		return nil, err
+	}
+	amt, _ := money.FromMinorUnits(amount, cur)
+	p := wagering.RehydrateParams{
+		ID: id, Origin: wagering.Origin(origin), Kind: wagering.Kind(kind), Status: wagering.Status(status),
+		WalletID: walletID, PlayerID: playerID, Amount: amt, ReferenceTransactionID: refID,
+		Attempts: attempts, NextAttemptAt: next, CreatedAt: created, UpdatedAt: updated,
+	}
+	if provider != nil {
+		p.External = &wagering.External{
+			ProviderID: *provider, ExternalTransactionID: deref(extID), IdempotencyKey: deref(key),
+			PayloadHash: deref(hash), RoundID: deref(round), GameID: deref(game),
+			ReferenceExternalTransactionID: deref(refExt),
+		}
+	}
+	if failure != nil {
+		p.FailureCode = wagering.FailureCode(*failure)
+	}
+	if balanceAfter != nil {
+		b, _ := money.FromMinorUnits(*balanceAfter, cur)
+		p.BalanceAfter = &b
+	}
+	return wagering.Rehydrate(p)
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}

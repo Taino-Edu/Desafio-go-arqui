@@ -24,8 +24,9 @@ type Config struct {
 }
 
 // NewHandler monta as rotas e os middlewares.
-func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, health *Health) http.Handler {
+func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers *app.WagerService, health *Health) http.Handler {
 	wh := walletHandlers{svc: wallets, log: log}
+	gh := wagerHandlers{svc: wagers, log: log}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", health.live)
@@ -34,6 +35,10 @@ func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, health
 	mux.HandleFunc("POST /wallets", wh.open)
 	mux.HandleFunc("GET /wallets/{walletId}", wh.get)
 	mux.HandleFunc("GET /wallets/{walletId}/ledger", wh.ledger)
+
+	mux.HandleFunc("POST /wagering/transactions", gh.submit)
+	mux.HandleFunc("GET /wagering/transactions/{transactionId}", gh.getByID)
+	mux.HandleFunc("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", gh.getByExternalID)
 
 	var h http.Handler = mux
 	h = withTimeout(cfg.RequestTimeout, h)

@@ -48,7 +48,24 @@ type WalletRepository interface {
 
 // TransactionRepository persiste operações financeiras.
 type TransactionRepository interface {
+	// Insert grava uma transação nova (usado pela abertura interna).
 	Insert(ctx context.Context, t *wagering.WagerTransaction) error
+	// InsertIfAbsent grava a transação se não houver outra com o mesmo
+	// (provedor, chave) ou (provedor, id externo). Se uma concorrente ainda
+	// não confirmada ocupa a chave, ESPERA o desfecho dela. Devolve false
+	// quando já existia.
+	InsertIfAbsent(ctx context.Context, t *wagering.WagerTransaction) (inserted bool, err error)
+	// FindExisting busca a transação que ocupa a chave ou o id externo do
+	// provedor (prioriza a chave). nil se nenhuma.
+	FindExisting(ctx context.Context, providerID, idempotencyKey, externalID string) (*wagering.WagerTransaction, error)
+	// GetByID e GetByExternalID devolvem ErrTransactionNotFound se não existir.
+	GetByID(ctx context.Context, id uuid.UUID) (*wagering.WagerTransaction, error)
+	GetByExternalID(ctx context.Context, providerID, externalID string) (*wagering.WagerTransaction, error)
+	// Update grava o novo estado (status, resultado, tentativas).
+	Update(ctx context.Context, t *wagering.WagerTransaction) error
+	// HasProcessedReversal informa se a transação já tem REFUND ou ROLLBACK
+	// concluído apontando para ela.
+	HasProcessedReversal(ctx context.Context, referenceID uuid.UUID) (bool, error)
 }
 
 // LedgerRepository persiste e lê lançamentos (append-only).

@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **4 — API de carteiras com Uber Fx**.
+> 🚧 Em construção. Fase atual: **5 — operações com idempotência e concorrência**.
 >
 > ⚠️ Autenticação ainda não está ligada nos endpoints (fase 7).
 
@@ -50,6 +50,18 @@ curl -s -X POST localhost:8080/wallets -H 'Content-Type: application/json' -d '{
   "initialBalance": {"amount": "1000.00", "currency": "BRL"}
 }'
 
+# aposta (Idempotency-Key obrigatório)
+curl -s -X POST localhost:8080/wagering/transactions \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: provider-a:transaction-123' -d '{
+  "providerId": "provider-a", "externalTransactionId": "transaction-123",
+  "playerId": "0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1", "walletId": "<walletId>",
+  "roundId": "round-987", "gameId": "fortune-chimp", "kind": "BET",
+  "money": {"amount": "25.00", "currency": "BRL"}
+}'
+# repita o mesmo comando: 200 com "idempotentReplay": true e o mesmo saldo
+
+curl -s localhost:8080/wagering/transactions/<transactionId>
+curl -s localhost:8080/providers/provider-a/wagering/transactions/transaction-123
 curl -s localhost:8080/wallets/<walletId>
 curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50'
 curl -s localhost:8080/health/ready
@@ -111,6 +123,9 @@ go vet ./...
 docker compose up -d postgres
 go test -tags=integration -race ./...
 
+# só os testes de concorrência e de 3 instâncias (compila cmd/server e sobe 3 processos)
+go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeIndependentInstances' ./test/integration/
+
 # fuzzing do parser de dinheiro (opcional)
 go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ```
@@ -132,6 +147,8 @@ internal/adapters/httpapi/   rotas, middlewares, erros, health
 internal/platform/config/    configuração por variáveis de ambiente
 internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
 internal/testsupport/pgtest/ banco descartável para testes de integração
+internal/testsupport/apptest/ aplicação completa + cliente HTTP para testes de ponta a ponta
+test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak
 docs/                        material de estudo

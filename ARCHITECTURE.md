@@ -11,10 +11,10 @@ correspondente é implementada (ver o roteiro em
 | [Carteira, ledger e transações](#carteira-ledger-e-transações) | ✅ |
 | [Banco, migrations e invariantes no schema](#banco-migrations-e-invariantes-no-schema) | ✅ |
 | [Transação SQL entre repositórios](#transação-sql-entre-repositórios) | ✅ |
-| [Contrato HTTP](#contrato-http) | 🟡 carteiras e health; operações na fase 5 |
-| Idempotência | ⏳ fase 5 |
-| Concorrência e locks | ⏳ fase 5 |
-| Reversões e referências pendentes | 🟡 regras de domínio na fase 2; worker e banco na fase 6 |
+| [Contrato HTTP](#contrato-http) | ✅ (reconciliação na fase 10) |
+| [Idempotência](#idempotência) | ✅ HTTP; SQS reutiliza o mesmo caso de uso na fase 8 |
+| [Concorrência e locks](#concorrência-e-locks) | ✅ |
+| Reversões e referências pendentes | 🟡 reversões e registro de `PENDING_REFERENCE` prontos; worker na fase 6 |
 | Autenticação e autorização | 🟡 Keycloak provisionado na fase 3; validação na fase 7 |
 | Inbox, SQS e DLQ | ⏳ fase 8 |
 | Outbox | ⏳ fase 9 |
@@ -430,14 +430,33 @@ Respostas de erro têm sempre o formato:
 | indisponibilidade transitória (banco, lock, timeout) | `503` + `Retry-After: 1` | `TEMPORARILY_UNAVAILABLE` |
 | erro inesperado (detalhes só no log) | `500` | `INTERNAL_ERROR` |
 
-Rejeição de negócio, conflito de idempotência e processamento pendente entram
-na fase 5.
+| chave de idempotência reutilizada com outro conteúdo | `409` | `IDEMPOTENCY_KEY_REUSED` |
+| `(providerId, externalTransactionId)` já registrado com outra chave | `409` | `DUPLICATE_TRANSACTION` |
+| transação inexistente | `404` | `NOT_FOUND` |
+
+Desfechos de `POST /wagering/transactions` (corpo `submitResponse`, sempre com
+`transactionId`, `status` e `idempotentReplay`):
+
+| Desfecho | Status | Corpo |
+|---|---|---|
+| processada (nova) | `201` | `balance` = saldo após a operação |
+| processada (replay) | `200` | o mesmo `balance` do processamento original |
+| aguardando referência | `202` | `status: PENDING_REFERENCE`, `nextAttemptAt` |
+| rejeição de negócio (nova ou replay) | `422` | `status: REJECTED`, `failureCode`, `failureCorrectable` |
+| falha permanente registrada | `422` | `status: FAILED`, `failureCode: PERMANENT_PROCESSING_ERROR` |
+
+Assim as situações são distinguíveis pelo contrato: entrada inválida (`400`),
+conflito (`409`), rejeição de negócio (`422`), pendente (`202`) e
+indisponibilidade transitória (`503`).
 
 | Endpoint | Sucesso |
 |---|---|
 | `POST /wallets` | `201` + `Location`; corpo com `id`, `playerId`, `balance`, `version` |
 | `GET /wallets/{walletId}` | `200` |
 | `GET /wallets/{walletId}/ledger?cursor=&limit=` | `200` `{walletId, items[], nextCursor}`; `limit` de 1 a 200 (padrão 50) |
+| `POST /wagering/transactions` (header `Idempotency-Key` obrigatório) | ver tabela de desfechos |
+| `GET /wagering/transactions/{transactionId}` | `200` com estado, resultado, tentativas e referência |
+| `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `200` (mesma visão) |
 | `GET /health/live` | `200` sempre que o processo responde |
 | `GET /health/ready` | `200` com Postgres ok; `503` se indisponível ou desligando |
 
@@ -449,3 +468,105 @@ na fase 5.
   que o valor devolvido na criação seja igual ao lido depois.
 
 > Autenticação ainda não está ligada: entra na fase 7, antes da entrega.
+
+---
+
+## Idempotência
+
+Arquivos: [`wagering/payload.go`](internal/domain/wagering/payload.go),
+[`app/wagering.go`](internal/app/wagering.go),
+[`postgres/repositories.go`](internal/adapters/postgres/repositories.go).
+
+### Chave
+
+- HTTP: header `Idempotency-Key` obrigatório (1 a 255 caracteres ASCII
+  visíveis). O cliente pode usar `{providerId}:{externalTransactionId}`, mas o
+  servidor **nunca** troca a chave recebida por uma calculada.
+- SQS (fase 8): `data.idempotencyKey`, mais a deduplicação da inbox.
+
+### Hash do conteúdo
+
+`sha256-canonical-json-v1`: SHA-256 (hex) do JSON canônico dos campos de negócio.
+
+| Entra no hash | Fica de fora |
+|---|---|
+| `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money.amount`, `money.currency`, `referenceExternalTransactionId` (se houver) | `Idempotency-Key`, headers, `messageId`, `occurredAt` e `type` do envelope SQS, `correlationId` |
+
+Canonicalização: chaves em ordem alfabética (inclusive em `money`), sem
+espaços, UUIDs em minúsculas, valor monetário na forma canônica validada
+(`"25.00"`), referência omitida quando vazia. Não há outra normalização: como
+só a forma canônica do valor é aceita na entrada, `"25.0"` é recusado com `400`
+em vez de gerar um hash diferente. O mesmo cálculo é usado por HTTP e SQS,
+então a mesma operação tem o mesmo hash pelas duas portas.
+
+### Persistência e decisão
+
+Índices únicos `(provider_id, idempotency_key)` e
+`(provider_id, external_transaction_id)`. O caso de uso faz, numa única
+transação:
+
+1. `INSERT ... ON CONFLICT DO NOTHING` da operação em `PENDING`. Se outra
+   requisição com a mesma chave está em andamento, o Postgres **faz esta
+   esperar** o desfecho da outra, em vez de deixar as duas passarem.
+2. Se não inseriu, lê a ocupante e decide:
+
+| Situação | Resposta |
+|---|---|
+| mesma chave, mesmo id externo, mesmo hash | replay do resultado persistido (`idempotentReplay: true`) |
+| mesma chave, conteúdo ou id externo diferente | `409 IDEMPOTENCY_KEY_REUSED` |
+| mesmo `(providerId, externalTransactionId)` com outra chave | `409 DUPLICATE_TRANSACTION` (não reaplica) |
+
+3. Se inseriu, segue o processamento e confirma estado, saldo, ledger e outbox
+   no mesmo `COMMIT`. Operações sem dependência vão de `PENDING` ao desfecho
+   sem commit intermediário; o `PENDING` nunca é visível isoladamente.
+
+O replay devolve o **saldo observado no processamento original**
+(`balance_after_minor` gravado na transação), mesmo que a carteira já tenha
+mudado. Rejeições também são persistidas e reproduzidas.
+
+Como tudo está no banco, a idempotência sobrevive a reinícios de todos os
+processos e vale entre instâncias diferentes.
+
+### Repetição automática
+
+Diante de `ErrTransient` (lock, deadlock, conexão), o caso de uso tenta até 3
+vezes com espera crescente. É seguro porque é idempotente: se uma tentativa
+chegou a confirmar, a seguinte vira replay.
+
+---
+
+## Concorrência e locks
+
+**Estratégia:** lock pessimista **por carteira** + controle otimista de versão +
+invariantes no banco. Nenhum lock global; nada depende de memória local.
+
+| Camada | Mecanismo | O que protege |
+|---|---|---|
+| 1 | `SELECT ... FOR UPDATE` só na linha da carteira | serializa operações da mesma carteira entre processos |
+| 2 | `UPDATE ... WHERE version = nova - 1` | se a camada 1 falhar, o escritor atrasado não sobrescreve (vira `ErrTransient` e repete) |
+| 3 | trigger de versão, checagem adiada saldo = ledger, `CHECK (balance >= 0)`, `UNIQUE (wallet_id, wallet_version)` | mesmo com o código Go errado, o banco recusa |
+| idempotência | `INSERT ... ON CONFLICT` sobre índices únicos | duplicatas simultâneas esperam e viram replay |
+| reversões | consulta sob o lock da carteira + índice único parcial | a mesma referência não é revertida duas vezes |
+
+Ordem dos locks numa operação: primeiro a linha da própria transação (índice
+de idempotência), depois a carteira. Como toda operação segue essa ordem e só
+trava uma carteira, não há ciclo de espera. `lock_timeout` (3s) limita a
+espera por uma carteira disputada.
+
+Experimento registrado: sem a camada 1, os testes continuam passando (a 2
+detecta e repete); sem as camadas 1 e 2, o banco ainda impede débito duplo e
+saldo negativo, mas o perdedor recebe `500` em vez de uma rejeição limpa.
+
+### Testes de concorrência (`test/integration`)
+
+| Teste | Cenário | Resultado exigido |
+|---|---|---|
+| `TestSameBet50TimesInParallel` | a mesma aposta 50 vezes ao mesmo tempo | 1 criada, 49 replays, 1 débito |
+| `TestTwoBetsOf80On100Concurrently` | 2 apostas de 80 sobre 100, em 15 carteiras ao mesmo tempo, e depois reenviadas | 1 processada, 1 `INSUFFICIENT_FUNDS`, saldo 20.00, 1 débito; reenvios iguais |
+| `TestDifferentWalletsAreNotBlocked` | carteira A travada por outra conexão | aposta na carteira B conclui na hora |
+| `TestManyWalletsManyBetsInParallel` | 200 apostas em 20 carteiras | nenhum lost update |
+| `TestThreeIndependentInstances` | os cenários acima com **3 processos** do servidor (binário compilado, pools e memória próprios), requisições espalhadas entre eles | mesmos resultados; shutdown gracioso por SIGTERM |
+
+Todos terminam com a reconciliação de todas as carteiras (saldo = créditos −
+débitos do ledger) e rodam com `-race`. Foram repetidos 5 vezes seguidas sem
+falha.
