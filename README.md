@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **10 — reconciliação e observabilidade**.
+> 🚧 Em construção. Fase atual: **11 — testes de caos e multi-instância**.
 
 ## Documentação
 
@@ -205,6 +205,9 @@ go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeInde
 # referências pendentes: chegada fora de ordem, expiração, reinício, workers concorrentes
 go test -tags=integration -race -run 'PendingReference' ./test/integration/
 
+# caos: Postgres e SQS fora do ar (proxy cortável), kill -9 sob carga em 3 processos, reinício
+go test -tags=integration -race -run 'TestChaos|TestRestart' ./test/integration/
+
 # reconciliação (consistente, divergência simulada, sob carga), métricas, logs e disputa de lock
 go test -tags=integration -race -run 'TestReconciliation|TestMetrics|TestLogs|TestLockContention' ./test/integration/
 
@@ -236,8 +239,9 @@ internal/testsupport/pgtest/ banco descartável para testes de integração
 internal/testsupport/apptest/ aplicação completa + cliente HTTP (com tokens reais) para testes
 internal/testsupport/idptest/ obtém tokens do Keycloak (client_credentials) para os testes
 internal/testsupport/sqstest/ filas FIFO descartáveis no LocalStack para os testes
+internal/testsupport/chaostest/ proxy TCP cortável: simula Postgres ou SQS fora do ar
 test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias, SQS,
-                             outbox, reconciliação, métricas e logs
+                             outbox, reconciliação, métricas, logs, caos (kill -9, dependências fora)
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak
 docs/                        material de estudo

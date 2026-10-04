@@ -21,6 +21,7 @@ correspondente é implementada (ver o roteiro em
 | [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco, worker de referências, consumidor SQS e publicador da outbox |
 | [Reconciliação](#reconciliação) | ✅ |
 | [Observabilidade](#observabilidade-métricas-e-logs) | ✅ métricas Prometheus, logs JSON com contexto, health |
+| [Caos, quedas e recuperação](#caos-quedas-e-recuperação) | ✅ kill -9 sob carga, reinício, Postgres e SQS fora do ar |
 
 ---
 
@@ -475,7 +476,7 @@ indisponibilidade transitória (`503`).
 | `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `200` (mesma visão) |
 | `POST /wallets/{walletId}/reconciliation` | `200` com o resultado, inclusive divergente (ver [Reconciliação](#reconciliação)) |
 | `GET /health/live` | `200` sempre que o processo responde |
-| `GET /health/ready` | `200` com Postgres (e SQS, se ligado) ok; `503` se indisponível ou desligando |
+| `GET /health/ready` | `200` com Postgres (e SQS, se ligado) ok; `503` se indisponível ou desligando. Cada verificação roda em paralelo com o próprio prazo (2s) |
 | `GET /metrics` | `200`, formato de exposição do Prometheus (público, ver [Observabilidade](#observabilidade-métricas-e-logs)) |
 
 - **Paginação:** ordem crescente de `walletVersion` (estável: lançamentos novos
@@ -1129,3 +1130,85 @@ medido como `500`.
 | `TestMetrics_ExposeOutcomesAndBacklog` | pela aplicação real: desfechos por status e porta, replay, conflito, latência, pendência resolvida pelo worker, atraso da outbox, rotas HTTP; nenhum id em `/metrics` |
 | `TestLogs_CarryIdentifiersAndNoSecrets` | `correlationId`, `transactionId`, `walletId`, `providerId` no log; token, `Bearer` e valores ausentes |
 | testes de SQS e outbox | `sqs_messages_total` por desfecho (processada, duplicata, DLQ), profundidade das filas, publicação da outbox com atraso zero no fim |
+
+---
+
+## Caos, quedas e recuperação
+
+Arquivos: [`test/integration/chaos_test.go`](test/integration/chaos_test.go),
+[`test/integration/crash_test.go`](test/integration/crash_test.go),
+[`internal/testsupport/chaostest`](internal/testsupport/chaostest).
+
+O enunciado pede que nenhuma destas situações gere movimentação duplicada,
+saldo negativo ou perda de evento confirmado: entrega repetida (HTTP e SQS),
+reversão antes da referência, concorrência na mesma carteira, **encerramento
+abrupto antes ou depois do commit**, publicação repetida e
+**indisponibilidade temporária do PostgreSQL ou do SQS**.
+
+### Ferramentas
+
+- **Processos reais:** `launchInstance` compila `cmd/server` e sobe
+  processos independentes; `kill` envia `SIGKILL` (sem shutdown gracioso,
+  como queda de máquina ou OOM). As transações abertas são desfeitas pelo
+  Postgres, as mensagens em mãos voltam à fila quando a visibilidade vence e
+  as reivindicações da outbox voltam quando o arrendamento vence.
+- **Dependência fora do ar:** `chaostest.Proxy` é um encaminhador TCP entre a
+  aplicação e o Postgres (ou o LocalStack). `Cut` derruba as conexões abertas
+  e recusa as novas; `Restore` religa. A dependência real continua de pé para
+  o teste conferir o estado.
+- **Cliente realista:** o `cluster` dos testes repete em outra instância,
+  com a **mesma** chave de idempotência, quando a conexão cai ou volta `503`,
+  como um cliente atrás de um balanceador.
+
+### Cenários
+
+| Teste | Falha provocada | O que precisa sobreviver |
+|---|---|---|
+| `TestChaos_PostgresOutage` | conexões com o banco cortadas | `503` + `Retry-After` sem nada gravado; readiness `503` e liveness `200`; `/metrics` responde; com o banco de volta, a mesma requisição é processada uma vez e o replay devolve `200` |
+| `TestChaos_SQSOutage` | conexões com o SQS cortadas (consumidor e publicador) | HTTP continua; eventos esperam na outbox (falhas contadas em `outbox_events_total{result="failed"}`) e a mensagem espera na fila; na volta, a mensagem é processada e **todo** evento confirmado chega à fila de eventos |
+| `TestRestart_KillDashNinePreservesEverything` | `kill -9` da instância; outra sobe no mesmo banco | replay devolve o resultado original (mesmo `transactionId` e saldo); a pendência (`REFUND` antes da aposta) continua e é concluída pelo worker da nova instância; reenvio da mensagem reconhecido pela inbox; eventos não publicados antes da queda são publicados depois |
+| `TestChaos_KillInstancesUnderLoad` | 3 instâncias completas (HTTP, consumidor, publicador, worker) sob carga HTTP + SQS; `kill -9` em uma a 25% da carga, uma substituta sobe, `kill -9` em outra a 60% | 108 operações aplicadas exatamente uma vez; saldos exatos (977.00 em cada carteira); débitos e créditos contados um a um; reconciliação consistente; inbox completa; DLQ vazia; todo evento confirmado publicado |
+
+Os quatro rodaram 4 vezes seguidas com `-race` sem falha. Nas execuções do
+teste sob carga, de 2 a 8 requisições por execução foram interrompidas pela
+queda e repetidas pelo cliente.
+
+### Mapa dos testes obrigatórios do enunciado
+
+| Exigência | Testes |
+|---|---|
+| 1. mesma aposta 50 vezes, um débito | `TestSameBet50TimesInParallel`; 51 vezes entre 3 processos em `TestThreeIndependentInstances` |
+| 2. duas apostas de 80.00 sobre 100.00 | `TestTwoBetsOf80On100Concurrently`; também entre 3 processos |
+| 3. carteiras distintas em paralelo | `TestDifferentWalletsAreNotBlocked`, `TestManyWalletsManyBetsInParallel` |
+| 4. três instâncias independentes | `TestThreeIndependentInstances`, `TestChaos_KillInstancesUnderLoad` |
+| 5. consumidor cai entre o commit e a remoção | `TestSQS_CrashAfterCommitBeforeDelete` (ponto exato, por gancho); `TestChaos_KillInstancesUnderLoad` (aleatório, por `kill -9`) |
+| 6. dois publishers na mesma outbox, recuperação | `TestOutbox_CompetingPublishersKeepOrderPerAggregate`, `TestOutbox_RecoversAbandonedClaim`, `TestOutbox_CrashBetweenPublishAndMarkRepublishesSameEventID` |
+| 7. reversão antes da referência | `TestPendingReference_ResolvedWhenReferenceArrives`, `TestPendingReference_ExpiresAsReferenceNotFound` |
+| 8. reinício preserva idempotência, pendências e consistência | `TestRestart_KillDashNinePreservesEverything`, `TestPendingReference_ResumedAfterRestart` |
+| HTTP e SQS na mesma operação | `TestSQS_SameOperationViaHTTPAndSQS` (inclusive ao mesmo tempo) |
+| indisponibilidade de PostgreSQL e SQS | `TestChaos_PostgresOutage`, `TestChaos_SQSOutage`, `TestStore_LockTimeoutIsTransient`, `TestSQS_TransientFailuresEndInDLQ` |
+| composição Fx, início e encerramento | `TestFxApp_*`, `TestSQS_GracefulShutdown`, parada por `SIGTERM` de todos os processos dos testes |
+
+Todos terminam conferindo saldo contra créditos menos débitos do ledger.
+
+### Bug encontrado pelo caos
+
+`TestChaos_SQSOutage` mostrou o readiness acusando o **Postgres** como fora do
+ar quando só o SQS estava. As verificações rodavam em sequência com um prazo
+único de 2s, e o SQS (o SDK retenta com backoff) consumia o prazo inteiro. Um
+balanceador tiraria do ar instâncias com banco saudável por causa da fila.
+Correção: cada verificação roda em paralelo, com o próprio prazo. O teste
+unitário `TestHealth` cobre o caso e falha sem a correção.
+
+### Limites desses testes
+
+São probabilísticos: o `kill -9` cai onde a carga estiver naquele instante.
+Um experimento registrado mostra isso: com um cliente que troca a chave de
+idempotência ao repetir, o teste continuou passando, porque nas execuções as
+quedas pegaram requisições ainda não confirmadas (conexão recusada), e
+repetir com outra chave era inofensivo. A janela "confirmou, mas a resposta
+não chegou" é estreita. Por isso as quedas em **pontos exatos** ficam nos
+testes determinísticos com ganchos (`TestSQS_CrashAfterCommitBeforeDelete`,
+`TestOutbox_RecoversAbandonedClaim`,
+`TestOutbox_CrashBetweenPublishAndMarkRepublishesSameEventID`), e o caos
+confirma que o sistema inteiro converge sob falhas reais.

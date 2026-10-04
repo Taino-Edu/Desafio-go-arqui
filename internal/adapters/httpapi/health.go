@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -46,13 +47,26 @@ func (h *Health) ready(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, healthBody{Status: "draining"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
-	defer cancel()
+	// as verificações rodam em paralelo, cada uma com o próprio prazo: uma
+	// dependência lenta (SQS retentando) não pode consumir o tempo das outras
+	// e fazer o Postgres parecer fora do ar
+	results := make([]error, len(h.checkers))
+	var wg sync.WaitGroup
+	for i, c := range h.checkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
+			defer cancel()
+			results[i] = c.Check(ctx)
+		}()
+	}
+	wg.Wait()
 
 	body := healthBody{Status: "ok", Checks: map[string]string{}}
 	status := http.StatusOK
-	for _, c := range h.checkers {
-		if err := c.Check(ctx); err != nil {
+	for i, c := range h.checkers {
+		if results[i] != nil {
 			body.Checks[c.Name()] = "unavailable"
 			body.Status, status = "unavailable", http.StatusServiceUnavailable
 			continue

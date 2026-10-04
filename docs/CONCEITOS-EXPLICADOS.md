@@ -419,6 +419,30 @@ com um lançamento novo no extrato.
 
 ---
 
+## 💥 16. Testes de caos
+
+**Analogia:** o **simulado de incêndio** de um prédio. Não basta ter a escada de
+emergência no projeto: você aciona o alarme de verdade, no meio do expediente, e
+confere se todo mundo saiu e nada se perdeu.
+
+Aqui o "incêndio" é provocado de propósito, com o sistema trabalhando:
+
+| Falha provocada | Como | O que conferimos depois |
+|---|---|---|
+| processo morre de repente | `kill -9` (sem tempo de se despedir) em 2 de 3 instâncias no meio da carga | cada aposta aplicada **uma vez só**, saldo exato, nenhum evento perdido |
+| reinício | derruba e sobe outra instância no mesmo banco | replay devolve o resultado original; pendência continua e é concluída |
+| banco fora do ar | um "cabo de rede" de mentira (proxy) que a gente corta e religa | API responde `503` (tente depois), nada pela metade; na volta, processa uma vez |
+| fila fora do ar | o mesmo proxy, na frente do SQS | eventos esperam na outbox e todos saem quando a fila volta |
+
+O caos achou um bug de verdade: com só a fila fora do ar, o health check dizia
+que o **banco** também estava fora, porque a verificação lenta da fila gastava o
+tempo de todas. Um balanceador tiraria do ar servidores saudáveis. Corrigido:
+cada verificação tem o próprio tempo.
+
+💬 *"Testei derrubando processos com kill -9 no meio da carga e cortando o banco e a fila. No fim, cada operação foi aplicada uma única vez, o saldo bateu com o extrato e nenhum evento confirmado se perdeu. E o teste de caos achou um bug no health check."*
+
+---
+
 ## 🎯 Resumo para explicar o plano em 30 segundos
 
 > "Recebo operações de provedores por HTTP e por fila. Assumo que tudo pode chegar

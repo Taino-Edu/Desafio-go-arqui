@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -199,6 +200,16 @@ func (r Response) ErrorCode() string {
 
 // Do envia uma requisição. headers alterna chave e valor.
 func (c *Client) Do(method, path string, body any, headers ...string) Response {
+	r, err := c.TryDo(method, path, body, headers...)
+	if err != nil {
+		c.t.Errorf("%s %s: %v", method, path, err)
+	}
+	return r
+}
+
+// TryDo é o Do que devolve o erro de transporte (conexão recusada ou
+// derrubada) em vez de falhar o teste: nos testes de queda, ele é esperado.
+func (c *Client) TryDo(method, path string, body any, headers ...string) (Response, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -217,13 +228,15 @@ func (c *Client) Do(method, path string, body any, headers ...string) Response {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.t.Errorf("%s %s: %v", method, path, err)
-		return Response{}
+		return Response{}, err
 	}
 	defer resp.Body.Close()
 	out := Response{Status: resp.StatusCode, Header: resp.Header}
-	_ = json.NewDecoder(resp.Body).Decode(&out.Body)
-	return out
+	if err := json.NewDecoder(resp.Body).Decode(&out.Body); err != nil && !errors.Is(err, io.EOF) {
+		// corpo cortado no meio: o processo caiu durante a resposta
+		return Response{}, err
+	}
+	return out, nil
 }
 
 // OpenWallet abre uma carteira e devolve seu id.
@@ -261,15 +274,24 @@ func (o Op) Body() map[string]any {
 
 // Submit envia a operação com a chave de idempotência.
 func (c *Client) Submit(o Op) Response {
+	r, err := c.TrySubmit(o)
+	if err != nil {
+		c.t.Errorf("submit %s: %v", o.ExternalID, err)
+	}
+	return r
+}
+
+// TrySubmit é o Submit que devolve o erro de transporte.
+func (c *Client) TrySubmit(o Op) (Response, error) {
 	key := o.Key
 	if key == "" {
 		key = o.Provider + ":" + o.ExternalID
 	}
 	if c.fixed == "" && !c.fixedNone {
 		// o provedor do corpo envia com o próprio token
-		return c.As(idptest.Token(c.t, o.Provider)).Do("POST", "/wagering/transactions", o.Body(), httpapi.HeaderIdempotencyKey, key)
+		return c.As(idptest.Token(c.t, o.Provider)).TryDo("POST", "/wagering/transactions", o.Body(), httpapi.HeaderIdempotencyKey, key)
 	}
-	return c.Do("POST", "/wagering/transactions", o.Body(), httpapi.HeaderIdempotencyKey, key)
+	return c.TryDo("POST", "/wagering/transactions", o.Body(), httpapi.HeaderIdempotencyKey, key)
 }
 
 // AssertReconciled confere, para TODAS as carteiras, que o saldo armazenado

@@ -66,34 +66,37 @@ type instance struct {
 	name   string
 	cmd    *exec.Cmd
 	client *apptest.Client
-	logs   *strings.Builder
+	logs   *lockedBuffer
+	waited chan struct{} // fechado quando o processo termina
+	err    error         // resultado de cmd.Wait (válido depois de waited)
 }
 
-// startInstances sobe n processos apontando para o mesmo banco.
+// lockedBuffer recebe a saída do processo (escrita por outra goroutine).
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// startInstances sobe n processos apontando para o mesmo banco, só com o
+// HTTP e o worker de referências (sem SQS nem publicador).
 func startInstances(t *testing.T, db *pgtest.DB, n int) []*instance {
 	t.Helper()
-	bin := serverBinary(t)
 	out := make([]*instance, n)
 	for i := range out {
-		port := freePort(t)
-		logs := &strings.Builder{}
-		cmd := exec.Command(bin)
-		cmd.Env = append(os.Environ(),
-			"DATABASE_URL="+db.AppURL,
-			fmt.Sprintf("HTTP_ADDR=127.0.0.1:%d", port),
-			fmt.Sprintf("INSTANCE_ID=instance-%d", i+1),
-			"DB_MAX_CONNS=10", "LOG_LEVEL=warn",
-			"OIDC_ISSUER="+idptest.Issuer(), "OIDC_AUDIENCE=wallet-api",
-			"SQS_ENABLED=false", "OUTBOX_PUBLISHER_ENABLED=false",
-		)
-		cmd.Stdout, cmd.Stderr = logs, logs
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-		inst := &instance{name: fmt.Sprintf("instance-%d", i+1), cmd: cmd, logs: logs,
-			client: apptest.NewClient(t, fmt.Sprintf("http://127.0.0.1:%d", port))}
-		out[i] = inst
-		t.Cleanup(func() { inst.stop(t) })
+		out[i] = launchInstance(t, db, fmt.Sprintf("instance-%d", i+1),
+			"SQS_ENABLED=false", "OUTBOX_PUBLISHER_ENABLED=false")
 	}
 	for _, inst := range out {
 		inst.waitReady(t)
@@ -101,10 +104,63 @@ func startInstances(t *testing.T, db *pgtest.DB, n int) []*instance {
 	return out
 }
 
+// launchInstance inicia um processo do servidor (sem esperar o readiness).
+// env acrescenta ou sobrescreve variáveis.
+func launchInstance(t *testing.T, db *pgtest.DB, name string, env ...string) *instance {
+	t.Helper()
+	port := freePort(t)
+	logs := &lockedBuffer{}
+	cmd := exec.Command(serverBinary(t))
+	cmd.Env = append(os.Environ(),
+		"DATABASE_URL="+db.AppURL,
+		fmt.Sprintf("HTTP_ADDR=127.0.0.1:%d", port),
+		"INSTANCE_ID="+name,
+		"DB_MAX_CONNS=10", "LOG_LEVEL=warn",
+		"OIDC_ISSUER="+idptest.Issuer(), "OIDC_AUDIENCE=wallet-api",
+	)
+	cmd.Env = append(cmd.Env, env...)
+	cmd.Stdout, cmd.Stderr = logs, logs
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	inst := &instance{name: name, cmd: cmd, logs: logs, waited: make(chan struct{}),
+		client: apptest.NewClient(t, fmt.Sprintf("http://127.0.0.1:%d", port))}
+	go func() {
+		inst.err = cmd.Wait()
+		close(inst.waited)
+	}()
+	t.Cleanup(func() { inst.stop(t) })
+	return inst
+}
+
+func (i *instance) exited() bool {
+	select {
+	case <-i.waited:
+		return true
+	default:
+		return false
+	}
+}
+
+// kill derruba o processo com SIGKILL: nada de shutdown gracioso, como uma
+// queda de máquina ou um OOM kill. Transações abertas são desfeitas pelo
+// Postgres; mensagens em mãos voltam à fila quando a visibilidade vence.
+func (i *instance) kill(t *testing.T) {
+	t.Helper()
+	if i.exited() {
+		return
+	}
+	_ = i.cmd.Process.Kill()
+	<-i.waited
+}
+
 func (i *instance) waitReady(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
+		if i.exited() {
+			t.Fatalf("%s terminou na partida (%v):\n%s", i.name, i.err, i.logs.String())
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		req, _ := http.NewRequestWithContext(ctx, "GET", i.client.Base()+"/health/ready", nil)
 		resp, err := http.DefaultClient.Do(req)
@@ -122,19 +178,18 @@ func (i *instance) waitReady(t *testing.T) {
 
 // stop envia SIGTERM e espera o shutdown gracioso.
 func (i *instance) stop(t *testing.T) {
-	if i.cmd.ProcessState != nil {
+	if i.exited() {
 		return
 	}
 	_ = i.cmd.Process.Signal(syscall.SIGTERM)
-	done := make(chan error, 1)
-	go func() { done <- i.cmd.Wait() }()
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("%s terminou com erro: %v\n%s", i.name, err, i.logs.String())
+	case <-i.waited:
+		if i.err != nil {
+			t.Errorf("%s terminou com erro: %v\n%s", i.name, i.err, i.logs.String())
 		}
 	case <-time.After(15 * time.Second):
 		_ = i.cmd.Process.Kill()
+		<-i.waited
 		t.Errorf("%s não desligou a tempo", i.name)
 	}
 }

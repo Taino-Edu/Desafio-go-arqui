@@ -111,7 +111,30 @@ func TestHealth(t *testing.T) {
 	if code, body := get(ok.ready); code != 503 || !strings.Contains(body, "draining") {
 		t.Errorf("ready durante shutdown = %d %s", code, body)
 	}
+
+	// regressão (achada no teste de caos do SQS): uma dependência lenta não
+	// pode consumir o prazo das outras e derrubar a verificação do banco
+	mixed := NewHealth(200*time.Millisecond, slowChecker{}, quickChecker{})
+	if code, body := get(mixed.ready); code != 503 || !strings.Contains(body, `"db":"ok"`) ||
+		!strings.Contains(body, `"slow":"unavailable"`) {
+		t.Errorf("ready com uma dependência lenta = %d %s", code, body)
+	}
 }
+
+// slowChecker só termina quando o prazo acaba (como um SQS retentando).
+type slowChecker struct{}
+
+func (slowChecker) Name() string { return "slow" }
+func (slowChecker) Check(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// quickChecker responde na hora, mas respeita o prazo (como o ping do pgx).
+type quickChecker struct{}
+
+func (quickChecker) Name() string                    { return "db" }
+func (quickChecker) Check(ctx context.Context) error { return ctx.Err() }
 
 func TestCorrelationMiddleware(t *testing.T) {
 	var seen string
