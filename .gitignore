@@ -1,0 +1,5 @@
+# binários e saídas locais
+/bin/
+*.out
+*.test
+.env
