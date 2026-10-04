@@ -461,7 +461,12 @@ Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
 Testes (`fxapp_integration_test.go`): `fx.ValidateApp` confere o grafo;
 `fxtest` sobe a aplicação com banco real, usa a API, desliga e confirma que a
 porta foi liberada e o pool fechado; outro teste confirma que sem banco a
-aplicação não inicia.
+aplicação não inicia. `TestFxApp_StopReleasesWorkers` sobe tudo ligado
+(worker de referências, consumidor SQS com 2 pollers e publicador da outbox),
+confere pelas pilhas das goroutines que elas existem e, depois do `Stop`, que
+nenhuma sobrou (nem a do pool do banco). Experimento registrado: com um
+`Stop` do worker que não para o loop, o teste falha apontando as duas
+goroutines vivas.
 
 ---
 
@@ -1220,7 +1225,7 @@ queda e repetidas pelo cliente.
 | 8. reinício preserva idempotência, pendências e consistência | `TestRestart_KillDashNinePreservesEverything`, `TestPendingReference_ResumedAfterRestart` |
 | HTTP e SQS na mesma operação | `TestSQS_SameOperationViaHTTPAndSQS` (inclusive ao mesmo tempo) |
 | indisponibilidade de PostgreSQL e SQS | `TestChaos_PostgresOutage`, `TestChaos_SQSOutage`, `TestStore_LockTimeoutIsTransient`, `TestSQS_TransientFailuresEndInDLQ` |
-| composição Fx, início e encerramento | `TestFxApp_*`, `TestSQS_GracefulShutdown`, parada por `SIGTERM` de todos os processos dos testes |
+| composição Fx, início e encerramento, liberação dos workers | `TestFxApp_*` (inclusive `StopReleasesWorkers`), `TestSQS_GracefulShutdown`, parada por `SIGTERM` de todos os processos dos testes |
 
 Todos terminam conferindo saldo contra créditos menos débitos do ledger.
 

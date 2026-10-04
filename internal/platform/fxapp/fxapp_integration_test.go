@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/platform/fxapp"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/idptest"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/pgtest"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/sqstest"
 )
 
 func testConfig(dbURL string) config.Config {
@@ -165,5 +167,80 @@ func TestFxApp_FailsToStartWithoutDatabase(t *testing.T) {
 func TestFxApp_GraphIsValid(t *testing.T) {
 	if err := fx.ValidateApp(fxapp.New(testConfig("postgres://x@localhost/db"), quietLogger)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// O encerramento libera os recursos dos workers: com o worker de
+// referências, o consumidor SQS e o publicador da outbox ligados, depois do
+// Stop não sobra nenhuma goroutine deles, nem do pool do banco.
+func TestFxApp_StopReleasesWorkers(t *testing.T) {
+	db := pgtest.New(t)
+	input := sqstest.New(t, 5*time.Second, 5)
+	events := sqstest.New(t, 30*time.Second, 5)
+	cfg := testConfig(db.AppURL)
+	cc := sqstest.ClientConfig()
+	cfg.SQS = config.SQS{
+		Enabled: true, Region: cc.Region, Endpoint: cc.Endpoint,
+		AccessKeyID: cc.AccessKeyID, SecretAccessKey: cc.SecretAccessKey,
+		InputQueue: input.URL, DLQ: input.DLQURL, ConsumerName: "fx-test",
+		Pollers: 2, MaxMessages: 10, WaitTime: 2 * time.Second,
+		RetryBaseDelay: time.Second, RetryMaxDelay: 2 * time.Second,
+	}
+	cfg.Outbox = config.Outbox{
+		Enabled: true, Queue: events.URL, BatchSize: 10, PollInterval: 50 * time.Millisecond,
+		Lease: 5 * time.Second, RetryBaseDelay: 100 * time.Millisecond, RetryMaxDelay: time.Second,
+	}
+
+	// marcadores das goroutines de longa duração da aplicação
+	markers := []string{
+		"internal/worker.(*Loop).run",                    // worker de referências e publicador da outbox
+		"internal/adapters/sqsconsumer.(*Consumer).poll", // pollers do consumidor
+		"pgxpool.(*Pool).backgroundHealthCheck",          // pool do banco
+	}
+	running := func() map[string]int {
+		buf := make([]byte, 1<<22)
+		stacks := string(buf[:runtime.Stack(buf, true)])
+		out := map[string]int{}
+		for _, m := range markers {
+			if n := strings.Count(stacks, m); n > 0 {
+				out[m] = n
+			}
+		}
+		return out
+	}
+
+	// linha de base: o próprio teste já tem pools abertos (banco descartável)
+	before := running()
+	grew := func(now map[string]int) map[string]int {
+		out := map[string]int{}
+		for m, n := range now {
+			if n > before[m] {
+				out[m] = n - before[m]
+			}
+		}
+		return out
+	}
+
+	var srv *httpapi.Server
+	app := fxtest.New(t, fxapp.New(cfg, quietLogger, fx.Populate(&srv)))
+	app.RequireStart()
+	// rodando: 2 loops (referências e outbox), 2 pollers e o pool da aplicação
+	deadline := time.Now().Add(5 * time.Second)
+	for len(grew(running())) < len(markers) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := grew(running()); len(got) < len(markers) {
+		t.Fatalf("goroutines esperadas durante a execução: %v", got)
+	}
+	t.Logf("durante a execução: %v", grew(running()))
+	app.RequireStop()
+
+	// depois do Stop: de volta à linha de base (a folga cobre o agendador)
+	deadline = time.Now().Add(2 * time.Second)
+	for len(grew(running())) > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := grew(running()); len(got) > 0 {
+		t.Errorf("goroutines da aplicação vivas depois do Stop: %v", got)
 	}
 }
