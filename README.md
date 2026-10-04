@@ -1,43 +1,84 @@
 # Desafio Go: processamento distribuído de apostas
 
 Implementação do [desafio backend em Go](https://github.com/junglegaming/backend-challenge-go):
-um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
-`ROLLBACK`) com garantias financeiras em ambiente distribuído.
+um serviço de carteiras que processa operações de provedores de jogos (`BET`,
+`WIN`, `LOSS`, `REFUND`, `ROLLBACK`) por **HTTP e SQS**, com garantias
+financeiras em ambiente distribuído: sem dinheiro em ponto flutuante, sem
+movimentação duplicada, sem saldo negativo, sem evento perdido, e funcionando
+com várias instâncias ao mesmo tempo.
 
-> 🚧 Em construção. Fase atual: **11 — testes de caos e multi-instância**.
+| Garantia | Como |
+|---|---|
+| dinheiro exato | `int64` em centavos, `Money` imutável, texto decimal canônico (`"25.00"`) |
+| extrato auditável | ledger append-only encadeado; o banco recusa edição e confere saldo = ledger no `COMMIT` |
+| sem duplicidade | idempotência persistida por `(provedor, chave)` e `(provedor, id externo)` + inbox para a fila |
+| sem lost update | `SELECT ... FOR UPDATE` por carteira + versão no `UPDATE` + triggers; nenhum lock em memória |
+| eventos confiáveis | transactional outbox: gravados no mesmo commit, publicados depois, at-least-once |
+| quem pode o quê | OAuth 2.0/OIDC (Keycloak), `client_credentials`; o provedor vem do token |
+| prova | testes com Postgres, Keycloak e LocalStack reais, 3 processos, `kill -9`, dependências fora do ar |
 
 ## Documentação
 
 | Documento | Para quê |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | decisões técnicas, preenchidas a cada fase |
-| [docs/GUIA-DO-DESAFIO.md](docs/GUIA-DO-DESAFIO.md) | guia técnico dos conceitos e roteiro de fases |
-| [docs/CONCEITOS-EXPLICADOS.md](docs/CONCEITOS-EXPLICADOS.md) | os mesmos conceitos sem jargão, com vídeos |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | decisões técnicas, interpretações, limitações e trabalho não concluído |
+| [docs/GUIA-DO-DESAFIO.md](docs/GUIA-DO-DESAFIO.md) | guia técnico dos conceitos e roteiro de construção |
+| [docs/CONCEITOS-EXPLICADOS.md](docs/CONCEITOS-EXPLICADOS.md) | os mesmos conceitos sem jargão, com analogias e vídeos |
 
 ## Pré-requisitos
 
-- Go 1.27+
-- Docker com Docker Compose v2
+- Docker com Docker Compose v2 (para tudo).
+- Go 1.27+ (para rodar testes ou a API fora do Docker).
+- `curl` e `jq` (para os exemplos e o [`scripts/demo.sh`](scripts/demo.sh)).
 
-## Ambiente local
+## Início rápido (checkout limpo)
 
 ```sh
-cp .env.example .env              # opcional: só para mudar portas
-docker compose up -d --build      # Postgres + migrations + LocalStack + Keycloak + API
-docker compose ps                 # aguarde os serviços "healthy"
+docker compose up --build         # Postgres + migrations + LocalStack (filas) + Keycloak + API
+# em outro terminal, quando a API estiver "healthy":
+./scripts/demo.sh                 # fluxo completo autenticado, conferindo cada resposta
 docker compose down -v            # derruba e apaga os dados
 ```
 
+O compose sobe tudo na ordem certa, sem passos manuais:
+
+1. **Postgres** cria os papéis `wallet_owner` (dono do schema) e `wallet_app`
+   (aplicação, sem DDL e sem `UPDATE`/`DELETE` no ledger) e o banco `wallet`.
+2. **migrate** aplica as migrations como `wallet_owner` e termina.
+3. **LocalStack** cria as filas FIFO e suas DLQs
+   ([`deploy/localstack/init-sqs.sh`](deploy/localstack/init-sqs.sh)).
+4. **Keycloak** importa o realm `wallet` com os clientes de teste
+   ([`deploy/keycloak/realm-wallet.json`](deploy/keycloak/realm-wallet.json)).
+5. **API** sobe depois que as migrations terminaram e o Keycloak e o
+   LocalStack estão saudáveis.
+
+O `scripts/demo.sh` passa por: `401` sem token, abertura de carteira, aposta
+(`201`), replay (`200`, mesmo saldo), chave reutilizada (`409`), provedor
+agindo por outro (`403`), saldo insuficiente (`422`), `REFUND` antes da aposta
+(`202`) concluído pelo worker, a mesma operação pela fila SQS, ledger,
+reconciliação e métricas.
+
 > Atrás de um proxy que inspeciona TLS, o `go mod download` do build pode
 > falhar com `x509: certificate signed by unknown authority`. Informe o bundle
-> de CAs do proxy: `EXTRA_CA_CERT=/caminho/ca.crt docker compose up -d --build`.
+> de CAs do proxy: `EXTRA_CA_CERT=/caminho/ca.crt docker compose up --build`.
 
 | Serviço | Endereço | Credenciais (só local) |
 |---|---|---|
-| PostgreSQL | `localhost:5432/wallet` | app `wallet_app/wallet_app`, migrations `wallet_owner/wallet_owner` |
+| API | `http://localhost:8080` | token do Keycloak (`client_credentials`), ver abaixo |
+| PostgreSQL | `localhost:5432/wallet` | app `wallet_app/wallet_app`, migrations `wallet_owner/wallet_owner`, admin `postgres/postgres` |
 | LocalStack (SQS) | `http://localhost:4566` | `test/test` |
 | Keycloak | `http://localhost:8081` | admin `admin/admin`; realm `wallet` |
-| API | `http://localhost:8080` | token do Keycloak (`client_credentials`), ver abaixo |
+
+As portas podem ser trocadas copiando [`.env.example`](.env.example) para `.env`.
+
+### Filas
+
+| Fila | Papel |
+|---|---|
+| `wager-transactions.fifo` | entrada: operações dos provedores (`MessageGroupId` = `walletId`) |
+| `wager-transactions-dlq.fifo` | mensagens inválidas ou que esgotaram as tentativas (`maxReceiveCount=5`), com o motivo |
+| `wallet-events.fifo` | saída: eventos publicados pela outbox (`MessageGroupId` = agregado) |
+| `wallet-events-dlq.fifo` | DLQ dos consumidores de eventos |
 
 ### Exemplos (fluxo autenticado)
 
@@ -124,11 +165,14 @@ docker compose exec postgres psql -U wallet_owner -d wallet -c \
 ### Rodar a API fora do Docker
 
 ```sh
-docker compose up -d postgres migrate keycloak
-DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=disable' \
-  OIDC_ISSUER=http://localhost:8081/realms/wallet \
-  HTTP_ADDR=:8080 go run ./cmd/server
+docker compose up -d postgres migrate keycloak localstack
+cp .env.example .env
+set -a; . ./.env; set +a
+go run ./cmd/server
 ```
+
+Variáveis de ambiente (a configuração inválida é recusada na partida, com
+código de saída 2):
 
 | Variável | Padrão | Uso |
 |---|---|---|
@@ -167,6 +211,23 @@ Listar as filas:
 docker compose exec localstack awslocal sqs list-queues
 ```
 
+### Várias instâncias
+
+Nada fica em memória entre requisições: idempotência, locks, pendências,
+inbox e outbox estão no Postgres. Para subir mais instâncias, basta mais
+processos com o mesmo `DATABASE_URL` (e `INSTANCE_ID` diferentes). Cada uma
+pode ligar ou não o consumidor (`SQS_ENABLED`), o publicador
+(`OUTBOX_PUBLISHER_ENABLED`) e o worker (`REFERENCE_WORKER_ENABLED`); com
+vários ligados, eles disputam o trabalho com segurança (`SKIP LOCKED`,
+arrendamento, inbox).
+
+```sh
+docker compose up -d postgres migrate keycloak localstack
+for i in 1 2 3; do
+  (set -a; . ./.env; set +a; HTTP_ADDR=:909$i INSTANCE_ID=local-$i go run ./cmd/server) &
+done
+```
+
 ## Migrations
 
 O serviço `migrate` do compose aplica tudo ao subir. Manualmente:
@@ -181,15 +242,42 @@ go run ./cmd/migrate version
 
 ## Testes
 
+### Unitários (sem dependências)
+
 ```sh
-go test ./...                       # unitários
-go test -race ./...                 # unitários com detector de race condition
-go vet ./...
+go test ./...
+go test -race ./...
+go vet ./... && go vet -tags=integration ./...
+gofmt -l .                          # vazio = tudo formatado
+```
 
-# integração: Postgres, Keycloak e LocalStack reais, um banco (e filas) descartáveis por teste
-docker compose up -d postgres keycloak localstack
-go test -tags=integration -race ./...
+### Integração (containers reais)
 
+Os testes de integração usam a build tag `integration` e rodam contra o
+Postgres, o Keycloak e o LocalStack do compose. **Nada é mockado.** Cada teste
+cria o próprio banco descartável (migrado como `wallet_owner`, usado como
+`wallet_app`) e as próprias filas, então podem rodar em qualquer ordem e não
+tocam nos dados do ambiente local.
+
+```sh
+# 1. dependências (a API do compose não é necessária: os testes sobem a aplicação)
+docker compose up -d postgres migrate keycloak localstack
+docker compose ps                   # postgres, keycloak e localstack "healthy"
+
+# 2. tudo (cerca de 70s)
+go test -tags=integration -race -count=1 ./...
+```
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `TEST_PG_ADMIN_URL` | `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable` | superusuário que cria e apaga os bancos de teste |
+| `TEST_SQS_ENDPOINT` | `http://localhost:4566` | LocalStack |
+
+Os tokens vêm do Keycloak real em `http://localhost:8081`.
+
+Por categoria:
+
+```sh
 # autenticação e isolamento entre provedores (Keycloak real)
 go test -tags=integration -race -run 'TestAuth' ./test/integration/
 
@@ -199,14 +287,22 @@ go test -tags=integration -race -run 'TestSQS' ./test/integration/
 # outbox: só após o commit, publicadores concorrentes, ordem, quedas, backoff
 go test -tags=integration -race -run 'TestOutbox' ./test/integration/
 
-# só os testes de concorrência e de 3 instâncias (compila cmd/server e sobe 3 processos)
+# concorrência e 3 instâncias independentes (compila cmd/server e sobe 3 processos)
 go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeIndependentInstances' ./test/integration/
 
 # referências pendentes: chegada fora de ordem, expiração, reinício, workers concorrentes
 go test -tags=integration -race -run 'PendingReference' ./test/integration/
 
-# caos: Postgres e SQS fora do ar (proxy cortável), kill -9 sob carga em 3 processos, reinício
+# simulações de falha: Postgres e SQS fora do ar (proxy cortável), kill -9 sob carga
+# em 3 processos completos, reinício preservando idempotência, pendências e saldo
 go test -tags=integration -race -run 'TestChaos|TestRestart' ./test/integration/
+
+# quedas em pontos exatos (ganchos): consumidor entre commit e remoção, publicador
+# entre reivindicar e publicar e entre publicar e confirmar
+go test -tags=integration -race -run 'CrashAfterCommit|RecoversAbandonedClaim|CrashBetweenPublish' ./test/integration/
+
+# schema, migrations (up/down/up), imutabilidade do ledger e composição Fx
+go test -tags=integration -race ./internal/adapters/postgres/ ./internal/platform/fxapp/
 
 # reconciliação (consistente, divergência simulada, sob carga), métricas, logs e disputa de lock
 go test -tags=integration -race -run 'TestReconciliation|TestMetrics|TestLogs|TestLockContention' ./test/integration/
@@ -214,6 +310,11 @@ go test -tags=integration -race -run 'TestReconciliation|TestMetrics|TestLogs|Te
 # fuzzing do parser de dinheiro (opcional)
 go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ```
+
+O mapa entre cada teste obrigatório do enunciado e o teste que o cobre está em
+[ARCHITECTURE.md](ARCHITECTURE.md#mapa-dos-testes-obrigatórios-do-enunciado).
+O CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) roda formatação,
+vet, unitários, build da imagem e a integração completa com `-race`.
 
 ## Estrutura
 
@@ -244,5 +345,6 @@ test/integration/            ponta a ponta: regras, idempotência, concorrência
                              outbox, reconciliação, métricas, logs, caos (kill -9, dependências fora)
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak
+scripts/demo.sh              demonstração ponta a ponta contra o compose
 docs/                        material de estudo
 ```

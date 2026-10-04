@@ -776,10 +776,10 @@ outbox_events  (event_id PK; índice em next_attempt_at WHERE published_at IS NU
 | Nível | Ferramenta | O que prova |
 |---|---|---|
 | Unitário | `testing`, table-driven | Money, Wallet, máquina de estados, regras dos 5 tipos, hash canônico |
-| Integração | `testcontainers-go` (Postgres, LocalStack, Keycloak reais) com `//go:build integration` | constraints, trigger do ledger, inbox, outbox, DLQ, auth real |
+| Integração | Postgres, LocalStack e Keycloak reais do docker compose (o plano previa `testcontainers-go`; a solução usa o compose, com banco e filas descartáveis por teste) e `//go:build integration` | constraints, trigger do ledger, inbox, outbox, DLQ, auth real |
 | Concorrência | goroutines + `-race` | 50 apostas iguais = 1 débito; 2 × 80 sobre 100 = 20 de saldo |
 | Multi-instância | 3 containers da app no compose (ou 3 `exec.Command`) | mesmos cenários com processos separados |
-| Falha | `kill -9`, hooks de falha por variável de ambiente (ex.: `FAULT_AFTER_COMMIT=1`) | crash entre commit e delete/publish |
+| Falha | `kill -9` em processos reais, proxy TCP cortável (Postgres/SQS fora do ar) e ganchos de falha injetados nos testes | crash entre commit e delete/publish, dependência fora, reinício |
 | Fx | `fxtest.New(t, ...)` com `RequireStart`/`RequireStop` | composição sobe e desce e libera recursos |
 
 No fim de cada teste: **reconciliação** (saldo = Σ ledger).
