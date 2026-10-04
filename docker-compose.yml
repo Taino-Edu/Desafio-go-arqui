@@ -1,0 +1,89 @@
+# Ambiente local: PostgreSQL, migrations, LocalStack (SQS) e Keycloak (OIDC).
+# Credenciais aqui são de DESENVOLVIMENTO LOCAL (ver .env.example).
+#
+#   docker compose up -d          # sobe tudo e aplica as migrations
+#   docker compose down -v        # derruba e apaga os volumes
+
+name: desafio-go-arqui
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/01-roles.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
+    healthcheck:
+      # só fica saudável depois que o script de papéis criou o banco "wallet"
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Aplica as migrations uma vez e termina. Roda como dono do schema.
+  migrate:
+    image: migrate/migrate:v4.20.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://wallet_owner:wallet_owner@postgres:5432/wallet?sslmode=disable
+      - up
+    restart: "no"
+
+  localstack:
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+      SQS_MAX_RECEIVE_COUNT: "5"
+      SQS_VISIBILITY_TIMEOUT: "30"
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      - ./deploy/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      # saudável só depois que o script de inicialização criou as filas
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  keycloak:
+    image: keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      # emissor fixo: tokens obtidos por localhost:8081 ou por keycloak:8080
+      # (de dentro da rede do compose) têm o mesmo "iss"
+      KC_HOSTNAME: http://localhost:${KEYCLOAK_PORT:-8081}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "${KEYCLOAK_PORT:-8081}:8080"
+    volumes:
+      - ./deploy/keycloak/realm-wallet.json:/opt/keycloak/data/import/realm-wallet.json:ro
+    healthcheck:
+      # a imagem não tem curl; usa /dev/tcp do bash na porta de gerenciamento
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"UP"' <&3
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  pgdata:

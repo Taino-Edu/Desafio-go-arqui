@@ -9,11 +9,11 @@ correspondente é implementada (ver o roteiro em
 | [Organização dos pacotes](#organização-dos-pacotes) | ✅ |
 | [Dinheiro (`Money`)](#dinheiro-money) | ✅ |
 | [Carteira, ledger e transações](#carteira-ledger-e-transações) | ✅ |
-| Banco, migrations e transação SQL | ⏳ fase 3 |
+| [Banco, migrations e invariantes no schema](#banco-migrations-e-invariantes-no-schema) | ✅ (transação SQL entre repositórios: fase 4) |
 | Idempotência | ⏳ fase 5 |
 | Concorrência e locks | ⏳ fase 5 |
 | Reversões e referências pendentes | 🟡 regras de domínio na fase 2; worker e banco na fase 6 |
-| Autenticação e autorização | ⏳ fase 7 |
+| Autenticação e autorização | 🟡 Keycloak provisionado na fase 3; validação na fase 7 |
 | Inbox, SQS e DLQ | ⏳ fase 8 |
 | Outbox | ⏳ fase 9 |
 | Uber Fx e shutdown | ⏳ fase 4+ |
@@ -234,3 +234,95 @@ envelope (`eventId`, `eventType`, `aggregateId`, `correlationId`,
 `events.NewEnvelope`, que copia tipo, versão, agregado e instante do evento.
 Instantes em UTC (RFC 3339), dinheiro como string decimal, e o payload é um
 snapshot (os metadados externos são copiados).
+
+---
+
+## Banco, migrations e invariantes no schema
+
+Arquivos: [`migrations/`](migrations), [`deploy/postgres/01-roles.sql`](deploy/postgres/01-roles.sql),
+[`internal/adapters/postgres/migrate.go`](internal/adapters/postgres/migrate.go).
+
+### Biblioteca e migrations
+
+- **Acesso:** `pgx/v5` com SQL explícito (sem ORM). Transações, locks e
+  constraints ficam visíveis no código e no schema.
+- **Migrations:** formato `golang-migrate` (`NNNNNN_nome.up.sql` /
+  `.down.sql`), embutidas no binário (`migrations.FS`). Aplicadas pelo serviço
+  `migrate` do compose ou por `go run ./cmd/migrate up|down <n|all>|version`.
+- **Dinheiro:** `BIGINT` em centavos + `CHAR(3)` (`^[A-Z]{3}$`).
+
+### Papéis
+
+| Papel | Uso | Pode |
+|---|---|---|
+| `postgres` | administração e testes | tudo |
+| `wallet_owner` | dono das tabelas; roda migrations | DDL |
+| `wallet_app` | aplicação | `SELECT/INSERT/UPDATE`; no ledger só `SELECT/INSERT`; nunca `DELETE`, `TRUNCATE` ou DDL |
+
+A aplicação não é dona das tabelas, então não consegue desligar triggers
+(`ALTER TABLE ... DISABLE TRIGGER` exige ser dono). Isso é testado.
+
+### Invariantes impostas pelo banco
+
+Valem mesmo que o código Go tenha um bug ou que alguém acesse o banco direto.
+
+| Invariante | Mecanismo |
+|---|---|
+| saldo nunca negativo | `CHECK (balance_minor >= 0)` |
+| uma carteira por `(player_id, currency)` | `UNIQUE` |
+| identidade da carteira imutável | trigger `wallets_guard_update` |
+| versão sobe exatamente 1 quando o saldo muda, e só então | trigger `wallets_guard_update` |
+| **saldo = ledger** | constraint trigger **adiado** `wallets_check_ledger`: no `COMMIT`, a versão atual da carteira precisa ter o lançamento com `balance_after` igual ao saldo |
+| lançamento fecha a conta | `CHECK` `balance_after = balance_before ± amount` |
+| lançamentos encadeados | trigger `ledger_guard_insert`: `balance_before` = `balance_after` do lançamento anterior (ou 0) |
+| moeda do lançamento = moeda da carteira | FK composta `(wallet_id, currency)` |
+| um lançamento por transação e por versão | `UNIQUE (wallet_id, transaction_id)`, `UNIQUE (wallet_id, wallet_version)` |
+| ledger append-only | triggers contra `UPDATE`/`DELETE`/`TRUNCATE` (inclusive do dono) + sem permissão para a aplicação |
+| idempotência | `UNIQUE (provider_id, external_transaction_id)` e `UNIQUE (provider_id, idempotency_key)` |
+| interno vs. externo | `CHECK wager_tx_origin_shape` |
+| um `OPENING` por carteira | índice único parcial |
+| uma reversão bem-sucedida por referência | índice único parcial `WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'` |
+| política de valor zero e de referência | `CHECK` por tipo |
+| campos exigidos por estado | `CHECK wager_tx_status_shape` |
+| máquina de estados | trigger `wager_tx_guard_update`: terminal não muda; só transições válidas; campos de negócio imutáveis |
+| registros financeiros não são apagados | triggers em `wallets` e `wager_transactions` |
+| inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
+| payload da outbox é snapshot | trigger `outbox_guard_update`; `published_at` não volta a nulo |
+
+Com o encadeamento e a checagem adiada, o saldo armazenado é sempre igual ao
+último `balance_after` da cadeia de lançamentos, e a cadeia começa em zero.
+A reconciliação (fase 10) passa a ser uma prova, não só um alerta.
+
+### Decisões e limitações
+
+- `wager_transactions.wallet_id` **não tem FK**: uma operação rejeitada com
+  `WALLET_NOT_FOUND` precisa ser persistida para o replay idempotente, e
+  aponta para uma carteira que não existe.
+- `wallet_version` foi acrescentado ao lançamento (além dos campos pedidos):
+  dá a ordem estável usada pela paginação do ledger e encadeia os lançamentos.
+- Os triggers rodam antes das FKs; por isso uma transação inexistente no
+  lançamento é barrada pelo trigger (`check_violation`), não pela FK.
+- Um superusuário ainda pode desligar triggers. A proteção é contra a
+  aplicação e contra o dono do schema em operação normal.
+
+### Ambiente local
+
+`docker compose up -d` sobe:
+
+| Serviço | Porta | O que faz |
+|---|---|---|
+| `postgres` | 5432 | cria `wallet_owner`, `wallet_app` e o banco `wallet` |
+| `migrate` | — | aplica as migrations e termina |
+| `localstack` | 4566 | SQS: `wager-transactions.fifo` e `wallet-events.fifo`, cada uma com DLQ (`maxReceiveCount=5`, visibilidade 30s) |
+| `keycloak` | 8081 | realm `wallet` com `provider-a`, `provider-b` (papel `provider`, claim `provider_id`) e `wallet-service` (papel `wallet-admin`); audiência `wallet-api` |
+
+O emissor do Keycloak é fixo (`KC_HOSTNAME`), então tokens obtidos de fora
+(`localhost:8081`) ou de dentro da rede do compose (`keycloak:8080`) têm o mesmo
+`iss`.
+
+### Testes de integração
+
+`//go:build integration`. Rodam contra o Postgres real do compose; cada teste
+cria um banco descartável (`pgtest.New`), aplica as migrations como
+`wallet_owner` e usa `wallet_app`, como a aplicação. Cada teste tenta violar
+uma invariante e confere o `SQLSTATE` devolvido.
