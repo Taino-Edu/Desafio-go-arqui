@@ -376,7 +376,46 @@ O Fx vê isso e entrega o banco pronto.
   falharam, quantos eventos estão atrasados).
 - **Health check:** "está vivo?" e "está pronto?" (o banco e a fila respondem?).
 
-💬 *"Logs estruturados com IDs de rastreio, métricas de negócio e de falhas, e health checks de liveness e readiness."*
+### Os três tipos de métrica
+
+| Tipo | Analogia | Exemplo no projeto |
+|---|---|---|
+| **Counter** (contador) | o **hodômetro** do carro: só sobe | `wager_transactions_total`: quantas apostas já foram processadas |
+| **Gauge** (medidor) | o **marcador de combustível**: sobe e desce | `outbox_lag_seconds`: há quanto tempo o evento mais antigo espera para sair |
+| **Histogram** | as **faixas de tempo de entrega** de um app de comida: quantos pedidos chegaram em até 10 min, até 30 min... | `wager_processing_duration_seconds`: quanto tempo cada operação levou |
+
+O Prometheus "passa na loja" a cada poucos segundos, lê o `/metrics` e guarda
+os números. Com isso dá para fazer gráfico e alarme ("mais de 5 conflitos de
+lock por minuto", "outbox atrasada mais de 1 minuto").
+
+**Cardinalidade:** cada combinação de rótulos vira uma série guardada para
+sempre. Por isso **nunca** se usa o id da carteira como rótulo: seria como
+criar uma coluna nova na planilha para cada cliente. Usamos o **molde** da
+rota (`/wallets/{walletId}`), não o endereço com o id.
+
+### correlationId: o número de protocolo
+
+É como o **número de protocolo** de uma central de atendimento: cada setor que
+mexe no seu caso anota o mesmo número. Aqui, a requisição (ou a mensagem da
+fila) recebe um id, e **todo log e todo evento** daquela operação carrega esse
+id. Para investigar um problema, basta filtrar por ele.
+
+### Reconciliação: contar o caixa com uma foto
+
+**Analogia:** você vai conferir o caixa de uma loja aberta. Conta as notas da
+gaveta e depois soma os recibos. Se uma venda acontece **entre** as duas
+contagens, os números não batem, e não é roubo, é só o momento errado.
+
+A solução é tirar uma **foto** da loja num instante e contar tudo nela. No
+banco, essa foto é uma transação `REPEATABLE READ` somente leitura: o saldo e
+a soma do extrato são lidos no mesmo instante. Testamos: sem a foto, 91 de
+1530 conferências feitas durante apostas acusaram um erro que não existia.
+
+E a reconciliação **só confere, nunca conserta**. Se não bater, ela avisa
+(na resposta, num log de erro e numa métrica), e a correção é decisão humana,
+com um lançamento novo no extrato.
+
+💬 *"Logs estruturados com IDs de rastreio, métricas de negócio e de falhas, e health checks de liveness e readiness. A reconciliação confere saldo contra extrato numa foto consistente do banco e só avisa, nunca corrige sozinha."*
 
 ---
 
@@ -388,7 +427,8 @@ O Fx vê isso e entrega o banco pronto.
 > Postgres. Tudo (saldo, extrato imutável, registro da mensagem e eventos) gravado
 > numa transação só. Eventos são publicados depois do commit via outbox.
 > Autenticação pelo Keycloak, com o provedor vindo do token. O Fx monta tudo e
-> desliga na ordem certa."
+> desliga na ordem certa. A reconciliação prova que o saldo bate com o extrato,
+> e as métricas mostram duplicatas, conflitos, DLQ e atraso da outbox."
 
 ---
 

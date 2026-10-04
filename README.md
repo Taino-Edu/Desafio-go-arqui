@@ -4,7 +4,7 @@ Implementação do [desafio backend em Go](https://github.com/junglegaming/backe
 um serviço de carteiras que processa apostas (`BET`, `WIN`, `LOSS`, `REFUND`,
 `ROLLBACK`) com garantias financeiras em ambiente distribuído.
 
-> 🚧 Em construção. Fase atual: **9 — publicador da outbox**.
+> 🚧 Em construção. Fase atual: **10 — reconciliação e observabilidade**.
 
 ## Documentação
 
@@ -78,7 +78,19 @@ curl -s localhost:8080/providers/provider-a/wagering/transactions/transaction-12
 curl -s localhost:8080/wagering/transactions/<transactionId> -H "Authorization: Bearer $ADMIN"
 curl -s localhost:8080/wallets/<walletId> -H "Authorization: Bearer $ADMIN"
 curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50' -H "Authorization: Bearer $ADMIN"
+
+# reconciliação: saldo armazenado x saldo reconstruído pelo ledger (não altera nada)
+curl -s -X POST localhost:8080/wallets/<walletId>/reconciliation -H "Authorization: Bearer $ADMIN"
+
 curl -s localhost:8080/health/ready   # público
+curl -s localhost:8080/metrics        # público, formato Prometheus
+```
+
+Métricas mais úteis (lista completa e decisões em
+[ARCHITECTURE.md](ARCHITECTURE.md#observabilidade-métricas-e-logs)):
+
+```sh
+curl -s localhost:8080/metrics | grep -E '^(wager_transactions_total|idempotent_replays_total|wallet_lock_conflicts_total|sqs_messages_total|sqs_queue_messages|outbox_lag_seconds|outbox_pending_events|reconciliation_mismatch_total)'
 ```
 
 Enviar uma operação pela fila (mesmo efeito e mesma idempotência do HTTP):
@@ -126,7 +138,7 @@ DATABASE_URL='postgres://wallet_app:wallet_app@localhost:5432/wallet?sslmode=dis
 | `OIDC_JWKS_URL` | `<issuer>/protocol/openid-connect/certs` | onde buscar as chaves públicas |
 | `HTTP_ADDR` | `:8080` | endereço do servidor |
 | `INSTANCE_ID` | hostname | identifica a instância nos logs |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` (health checks e `/metrics` são logados em `debug`) |
 | `DB_MAX_CONNS` | `20` | conexões do pool |
 | `DB_STATEMENT_TIMEOUT` / `DB_LOCK_TIMEOUT` | `5s` / `3s` | limites por comando e por espera de lock |
 | `HTTP_REQUEST_TIMEOUT` | `10s` | prazo de cada requisição |
@@ -193,6 +205,9 @@ go test -tags=integration -race -run 'Parallel|Concurrently|NotBlocked|ThreeInde
 # referências pendentes: chegada fora de ordem, expiração, reinício, workers concorrentes
 go test -tags=integration -race -run 'PendingReference' ./test/integration/
 
+# reconciliação (consistente, divergência simulada, sob carga), métricas, logs e disputa de lock
+go test -tags=integration -race -run 'TestReconciliation|TestMetrics|TestLogs|TestLockContention' ./test/integration/
+
 # fuzzing do parser de dinheiro (opcional)
 go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ```
@@ -212,7 +227,8 @@ internal/app/                casos de uso e portas (interfaces)
 internal/adapters/postgres/  repositórios pgx, transação (Store), migrations
 internal/adapters/httpapi/   rotas, middlewares (inclusive autenticação), erros, health
 internal/adapters/auth/      validação de JWT do Keycloak (OIDC, JWKS)
-internal/adapters/sqsconsumer/ consumidor SQS (envelope, inbox via app, DLQ, backoff, shutdown)
+internal/adapters/sqsconsumer/ consumidor SQS (envelope, inbox via app, DLQ, backoff, shutdown) e publicador
+internal/adapters/observability/ métricas Prometheus (/metrics) e log com correlationId do contexto
 internal/platform/config/    configuração por variáveis de ambiente
 internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
 internal/worker/             loop genérico de trabalho em segundo plano (parada observável)
@@ -220,7 +236,8 @@ internal/testsupport/pgtest/ banco descartável para testes de integração
 internal/testsupport/apptest/ aplicação completa + cliente HTTP (com tokens reais) para testes
 internal/testsupport/idptest/ obtém tokens do Keycloak (client_credentials) para os testes
 internal/testsupport/sqstest/ filas FIFO descartáveis no LocalStack para os testes
-test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias
+test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias, SQS,
+                             outbox, reconciliação, métricas e logs
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak
 docs/                        material de estudo

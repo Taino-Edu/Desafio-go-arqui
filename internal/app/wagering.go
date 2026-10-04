@@ -22,10 +22,12 @@ type WagerService struct {
 	clock     Clock
 	ids       IDGenerator
 	refPolicy wagering.ReferenceRetryPolicy
+	metrics   Metrics
 }
 
-func NewWagerService(store Store, clock Clock, ids IDGenerator, refPolicy wagering.ReferenceRetryPolicy) *WagerService {
-	return &WagerService{store: store, clock: clock, ids: ids, refPolicy: refPolicy}
+func NewWagerService(store Store, clock Clock, ids IDGenerator, refPolicy wagering.ReferenceRetryPolicy, opts ...Option) *WagerService {
+	o := applyOptions(opts)
+	return &WagerService{store: store, clock: clock, ids: ids, refPolicy: refPolicy, metrics: o.metrics}
 }
 
 // SubmitInput é uma operação recebida de um provedor.
@@ -56,19 +58,43 @@ const maxTransientAttempts = 3
 
 // Submit valida e processa uma operação com idempotência persistente.
 func (s *WagerService) Submit(ctx context.Context, in SubmitInput) (SubmitResult, error) {
+	start := time.Now()
 	kind, hash, err := prepare(in)
 	if err != nil {
 		return SubmitResult{}, err
 	}
 	var res SubmitResult
-	err = s.retryTransient(ctx, func() error {
+	err = s.retryTransient(ctx, SourceHTTP, func() error {
 		return s.store.WithinTx(ctx, func(ctx context.Context, r Repositories) error {
 			var err error
 			res, err = s.submitInTx(ctx, r, in, kind, hash)
 			return err
 		})
 	})
-	return res, err
+	s.observe(SourceHTTP, res, err, start)
+	if err != nil {
+		return SubmitResult{}, err // nada de uma tentativa desfeita sobrevive
+	}
+	return res, nil
+}
+
+// observe registra o desfecho de um envio nas métricas.
+func (s *WagerService) observe(source string, res SubmitResult, err error, start time.Time) {
+	switch {
+	case errors.Is(err, ErrIdempotencyKeyReused):
+		s.metrics.IdempotencyConflict(source, ConflictKeyReused)
+	case errors.Is(err, ErrDuplicateTransaction):
+		s.metrics.IdempotencyConflict(source, ConflictDuplicateTransaction)
+	case err != nil:
+		// falhas de infraestrutura aparecem em retries, conflitos e no HTTP
+	case res.Replay:
+		s.metrics.IdempotentReplay(source)
+		s.metrics.ProcessingDuration(source, time.Since(start))
+	default:
+		tx := res.Transaction
+		s.metrics.WagerOutcome(source, string(tx.Kind()), string(tx.Status()))
+		s.metrics.ProcessingDuration(source, time.Since(start))
+	}
 }
 
 // prepare valida o tipo e calcula o hash do conteúdo de negócio.
@@ -88,24 +114,27 @@ func prepare(in SubmitInput) (wagering.Kind, string, error) {
 	return kind, hash, nil
 }
 
-// retryTransient repete fn diante de ErrTransient, com espera crescente.
-func (s *WagerService) retryTransient(ctx context.Context, fn func() error) error {
-	var last error
-	for attempt := 0; attempt < maxTransientAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return last
-			case <-time.After(time.Duration(attempt*attempt) * 20 * time.Millisecond):
-			}
-		}
+// retryTransient repete fn diante de ErrTransient, com espera crescente
+// (20ms, 80ms), e conta as novas tentativas e as disputas de escrita.
+func (s *WagerService) retryTransient(ctx context.Context, source string, fn func() error) error {
+	for attempt := 1; ; attempt++ {
 		err := fn()
 		if err == nil || !errors.Is(err, ErrTransient) {
 			return err
 		}
-		last = err
+		if errors.Is(err, ErrConcurrencyConflict) {
+			s.metrics.ConcurrencyConflict(source)
+		}
+		if attempt == maxTransientAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt*attempt) * 20 * time.Millisecond):
+		}
+		s.metrics.TransientRetry(source) // só conta a tentativa que vai acontecer
 	}
-	return last
 }
 
 // submitInTx processa a operação dentro de uma transação SQL já aberta. É o
@@ -150,7 +179,7 @@ func (s *WagerService) submitInTx(ctx context.Context, r Repositories, in Submit
 			}
 			if existing == nil {
 				// a ocupante foi desfeita entre o INSERT e a busca: tenta de novo
-				return fmt.Errorf("%w: idempotency slot released concurrently", ErrTransient)
+				return fmt.Errorf("%w: %w: idempotency slot released concurrently", ErrTransient, ErrConcurrencyConflict)
 			}
 			if err := matchExisting(existing, in.IdempotencyKey, in.ExternalTransactionID, hash); err != nil {
 				return err

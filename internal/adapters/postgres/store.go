@@ -58,6 +58,23 @@ func (s *Store) WithinTx(ctx context.Context, fn func(ctx context.Context, r app
 	return nil
 }
 
+// ReadSnapshot abre uma transação REPEATABLE READ somente leitura: a foto do
+// banco é tirada na primeira consulta e vale para todas as seguintes, mesmo
+// que outras transações confirmem no meio. Termina com ROLLBACK: não há nada
+// a confirmar, e qualquer tentativa de escrita já teria falhado.
+func (s *Store) ReadSnapshot(ctx context.Context, fn func(ctx context.Context, r app.Repositories) error) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return classify(fmt.Errorf("begin: %w", err))
+	}
+	defer func() {
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+		_ = tx.Rollback(rbCtx)
+	}()
+	return classify(fn(ctx, repositories{q: tx}))
+}
+
 // Reader devolve repositórios que usam o pool diretamente (sem transação).
 func (s *Store) Reader() app.Repositories { return repositories{q: s.pool} }
 

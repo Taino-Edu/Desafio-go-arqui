@@ -104,8 +104,7 @@ func (h walletHandlers) open(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, h.log, err)
 		return
 	}
-	h.log.InfoContext(r.Context(), "wallet opened", "walletId", wal.ID(),
-		"correlationId", app.CorrelationID(r.Context()))
+	h.log.InfoContext(r.Context(), "wallet opened", "walletId", wal.ID())
 	w.Header().Set("Location", "/wallets/"+wal.ID().String())
 	writeJSON(w, http.StatusCreated, toWalletResponse(wal))
 }
@@ -182,6 +181,52 @@ func (h walletHandlers) ledger(w http.ResponseWriter, r *http.Request) {
 		resp.NextCursor = &page.NextCursor
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+type reconciliationResponse struct {
+	WalletID          string   `json:"walletId"`
+	StoredBalance     MoneyDTO `json:"storedBalance"`
+	CalculatedBalance MoneyDTO `json:"calculatedBalance"`
+	Difference        MoneyDTO `json:"difference"`
+	Consistent        bool     `json:"consistent"`
+	CheckedEntries    int64    `json:"checkedEntries"`
+}
+
+// POST /wallets/{walletId}/reconciliation
+//
+// 200 sempre que a conferência roda: divergência é um RESULTADO
+// (consistent=false), não um erro do pedido. Ela também vira log de erro e
+// métrica (reconciliation_mismatch_total). Nada é alterado.
+func (h walletHandlers) reconcile(w http.ResponseWriter, r *http.Request) {
+	if !h.authorize(w, r) {
+		return
+	}
+	id, err := parseUUID("walletId", r.PathValue("walletId"))
+	if err != nil {
+		writeError(w, r, h.log, err)
+		return
+	}
+	rec, err := h.svc.Reconcile(r.Context(), id)
+	if err != nil {
+		writeError(w, r, h.log, err)
+		return
+	}
+	if rec.Consistent {
+		h.log.InfoContext(r.Context(), "reconciliation consistent",
+			"walletId", id, "checkedEntries", rec.CheckedEntries)
+	} else {
+		// só a diferença: o suficiente para investigar, sem expor saldos no log
+		h.log.ErrorContext(r.Context(), "reconciliation mismatch",
+			"walletId", id, "difference", rec.Difference.String(), "checkedEntries", rec.CheckedEntries)
+	}
+	writeJSON(w, http.StatusOK, reconciliationResponse{
+		WalletID:          id.String(),
+		StoredBalance:     toMoneyDTO(rec.StoredBalance),
+		CalculatedBalance: toMoneyDTO(rec.CalculatedBalance),
+		Difference:        toMoneyDTO(rec.Difference),
+		Consistent:        rec.Consistent,
+		CheckedEntries:    rec.CheckedEntries,
+	})
 }
 
 // authorize: operações de carteira são restritas ao serviço interno.

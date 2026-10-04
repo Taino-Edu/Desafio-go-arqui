@@ -759,10 +759,13 @@ outbox_events  (event_id PK; índice em next_attempt_at WHERE published_at IS NU
   `transactionId`, `walletId`, `providerId`, `messageId`. **Nunca** logar token
   nem o payload inteiro.
 - **Métricas Prometheus** em `/metrics`:
-  `wager_transactions_total{status,kind}`, `idempotent_replays_total`,
-  `sqs_retries_total`, `sqs_dlq_total`, `wallet_lock_conflicts_total`,
+  `wager_transactions_total{source,kind,status}`, `idempotent_replays_total`,
+  `sqs_messages_total{outcome}` (processada, duplicata, retry, DLQ),
+  `sqs_queue_messages{queue}`, `wallet_lock_conflicts_total`,
   `outbox_lag_seconds` (idade do evento não publicado mais antigo),
   `wager_processing_duration_seconds` (histograma), `reconciliation_mismatch_total`.
+  Lista completa e decisões no
+  [ARCHITECTURE.md](../ARCHITECTURE.md#observabilidade-métricas-e-logs).
 - **Health:** `/health/live` sempre 200 se o processo está de pé;
   `/health/ready` faz `SELECT 1` no Postgres e `GetQueueAttributes` no SQS.
 

@@ -3,6 +3,7 @@ package sqsconsumer
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -51,6 +52,22 @@ func ResolveQueueURL(ctx context.Context, c *sqs.Client, nameOrURL string) (stri
 		return "", fmt.Errorf("sqs queue %q: %w", nameOrURL, err)
 	}
 	return aws.ToString(out.QueueUrl), nil
+}
+
+// QueueDepth devolve o número aproximado de mensagens visíveis na fila.
+func QueueDepth(ctx context.Context, c *sqs.Client, url string) (int64, error) {
+	attr := types.QueueAttributeNameApproximateNumberOfMessages
+	out, err := c.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl: aws.String(url), AttributeNames: []types.QueueAttributeName{attr},
+	})
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(out.Attributes[string(attr)], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("sqs %s: %w", attr, err)
+	}
+	return n, nil
 }
 
 // HealthChecker verifica se a fila de entrada responde (readiness).

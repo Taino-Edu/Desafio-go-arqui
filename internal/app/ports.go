@@ -21,6 +21,10 @@ import (
 // outbox ficam atômicos.
 type Store interface {
 	WithinTx(ctx context.Context, fn func(ctx context.Context, r Repositories) error) error
+	// ReadSnapshot roda fn numa transação SOMENTE LEITURA em que todas as
+	// consultas enxergam a mesma foto do banco (REPEATABLE READ), mesmo que
+	// outras transações confirmem no meio. Qualquer escrita falha.
+	ReadSnapshot(ctx context.Context, fn func(ctx context.Context, r Repositories) error) error
 	// Reader devolve repositórios fora de transação, para consultas.
 	Reader() Repositories
 }
@@ -75,6 +79,8 @@ type TransactionRepository interface {
 	// pendências que esperam (providerID, externalID). Não espera por linhas
 	// travadas por outra transação (SKIP LOCKED), então não causa deadlock.
 	NudgePendingReferences(ctx context.Context, providerID, externalID string, now time.Time) error
+	// CountPendingReferences conta as operações em PENDING_REFERENCE.
+	CountPendingReferences(ctx context.Context) (int64, error)
 }
 
 // LedgerRepository persiste e lê lançamentos (append-only).
@@ -83,6 +89,15 @@ type LedgerRepository interface {
 	// List devolve até limit lançamentos com wallet_version > afterVersion,
 	// em ordem crescente de versão.
 	List(ctx context.Context, walletID uuid.UUID, afterVersion int64, limit int) ([]wallet.LedgerEntry, error)
+	// Totals soma TODOS os lançamentos da carteira, abertura incluída.
+	Totals(ctx context.Context, walletID uuid.UUID) (LedgerTotals, error)
+}
+
+// LedgerTotals resume o ledger de uma carteira, em unidades mínimas.
+type LedgerTotals struct {
+	Credits int64 // Σ créditos
+	Debits  int64 // Σ débitos
+	Entries int64 // quantidade de lançamentos
 }
 
 // InboxEntry é o registro de uma mensagem recebida por um consumidor.
@@ -116,6 +131,9 @@ type OutboxRepository interface {
 	MarkPublished(ctx context.Context, eventID uuid.UUID, now time.Time) error
 	// MarkFailed libera o evento para nova tentativa em nextAttemptAt.
 	MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, nextAttemptAt time.Time, cause string) error
+	// Backlog conta os eventos não publicados e devolve o occurred_at do mais
+	// antigo deles (nil quando não há nenhum).
+	Backlog(ctx context.Context) (pending int64, oldest *time.Time, err error)
 }
 
 // OutboxMessage é um evento reivindicado para publicação.

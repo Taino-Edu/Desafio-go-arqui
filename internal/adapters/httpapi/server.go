@@ -25,14 +25,17 @@ type Config struct {
 
 // NewHandler monta as rotas e os middlewares.
 func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers *app.WagerService,
-	health *Health, verifier TokenVerifier) http.Handler {
+	health *Health, verifier TokenVerifier, obs Observability) http.Handler {
 	wh := walletHandlers{svc: wallets, log: log}
 	gh := wagerHandlers{svc: wagers, log: log}
 
-	// públicas
+	// públicas (operacionais; sem dados de negócio)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", health.live)
 	mux.HandleFunc("GET /health/ready", health.ready)
+	if obs.MetricsHandler != nil {
+		mux.Handle("GET /metrics", obs.MetricsHandler)
+	}
 
 	// negócio: sempre autenticadas; a autorização fica em cada handler
 	protect := func(h http.HandlerFunc) http.Handler { return withAuth(verifier, log, h) }
@@ -40,14 +43,20 @@ func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers
 	mux.Handle("POST /wallets", protect(wh.open))
 	mux.Handle("GET /wallets/{walletId}", protect(wh.get))
 	mux.Handle("GET /wallets/{walletId}/ledger", protect(wh.ledger))
+	mux.Handle("POST /wallets/{walletId}/reconciliation", protect(wh.reconcile))
 
 	mux.Handle("POST /wagering/transactions", protect(gh.submit))
 	mux.Handle("GET /wagering/transactions/{transactionId}", protect(gh.getByID))
 	mux.Handle("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", protect(gh.getByExternalID))
 
+	// Middlewares, de dentro para fora. A ordem importa: withRecover fica
+	// dentro de withMetrics para que um panic seja medido como 500;
+	// withMetrics fica colado no mux para ler r.Pattern; withCorrelation é o
+	// primeiro a rodar, então tudo abaixo já tem o correlationId.
 	var h http.Handler = mux
-	h = withTimeout(cfg.RequestTimeout, h)
 	h = withRecover(log, h)
+	h = withMetrics(obs.Requests, h)
+	h = withTimeout(cfg.RequestTimeout, h)
 	h = withLogging(log, h)
 	h = withCorrelation(h)
 	return h

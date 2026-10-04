@@ -91,7 +91,7 @@ func (h wagerHandlers) submit(w http.ResponseWriter, r *http.Request) {
 	h.log.InfoContext(r.Context(), "wager transaction submitted",
 		"transactionId", tx.ID(), "walletId", tx.WalletID(), "providerId", in.ProviderID,
 		"kind", tx.Kind(), "status", tx.Status(), "failureCode", tx.FailureCode(),
-		"idempotentReplay", res.Replay, "correlationId", app.CorrelationID(r.Context()))
+		"idempotentReplay", res.Replay)
 
 	writeJSON(w, submitStatus(tx.Status(), res.Replay), toSubmitResponse(tx, res.Replay))
 }

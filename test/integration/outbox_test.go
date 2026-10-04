@@ -146,6 +146,10 @@ func TestOutbox_PublishesCommittedEvents(t *testing.T) {
 	if n := apptest.Count(t, db, `SELECT count(*) FROM outbox_events WHERE published_at IS NOT NULL AND locked_by IS NULL`); n != 4 {
 		t.Errorf("publicados e liberados = %d", n)
 	}
+	// tudo publicado: nada pendente e atraso zero
+	a.Client.WaitMetric(`outbox_events_total{result="published"}`, 4, 5*time.Second)
+	a.Client.WaitMetric(`outbox_pending_events`, 0, time.Second)
+	a.Client.WaitMetric(`outbox_lag_seconds`, 0, time.Second)
 }
 
 // Evento de uma transação ainda aberta não existe para o publicador.

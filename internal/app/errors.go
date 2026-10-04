@@ -30,4 +30,9 @@ var (
 	// deadlock, disputa de lock). Pode ser tentada de novo; nada foi confirmado.
 	// Os adaptadores embrulham seus erros com este sentinela.
 	ErrTransient = errors.New("temporarily unavailable")
+
+	// ErrConcurrencyConflict: a falha transitória foi uma disputa de escrita
+	// (lock_timeout, deadlock, falha de serialização, versão desatualizada).
+	// Sempre vem junto com ErrTransient; existe para ser contada à parte.
+	ErrConcurrencyConflict = errors.New("concurrency conflict")
 )

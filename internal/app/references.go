@@ -40,6 +40,7 @@ type ResolvePendingResult struct {
 // Se o processo morrer no meio, a transação é desfeita e a pendência continua
 // lá, vencida: qualquer instância a pega de novo.
 func (s *WagerService) ResolveNextPending(ctx context.Context) (ResolvePendingResult, error) {
+	start := time.Now()
 	entryID, err := s.ids.NewID()
 	if err != nil {
 		return ResolvePendingResult{}, err
@@ -53,6 +54,11 @@ func (s *WagerService) ResolveNextPending(ctx context.Context) (ResolvePendingRe
 			return err
 		}
 		res = ResolvePendingResult{Found: true, Transaction: tx}
+		if CorrelationID(ctx) == "" {
+			// sem requisição de origem: o id da operação amarra os eventos
+			// desta conclusão aos dados do evento de pendência
+			ctx = WithCorrelationID(ctx, tx.ID().String())
+		}
 
 		w, err := r.Wallets().GetForUpdate(ctx, tx.WalletID())
 		if err != nil && !errors.Is(err, ErrWalletNotFound) {
@@ -90,7 +96,19 @@ func (s *WagerService) ResolveNextPending(ctx context.Context) (ResolvePendingRe
 		return s.persist(ctx, r, tx, w, entry)
 	})
 	if err != nil {
+		if errors.Is(err, ErrConcurrencyConflict) {
+			s.metrics.ConcurrencyConflict(SourceWorker)
+		}
 		return ResolvePendingResult{}, err
+	}
+	if res.Found {
+		s.metrics.ReferenceResolution(string(res.Outcome))
+		if res.Outcome != ReferenceRescheduled {
+			// desfecho final da operação que esperava a referência
+			tx := res.Transaction
+			s.metrics.WagerOutcome(SourceWorker, string(tx.Kind()), string(tx.Status()))
+			s.metrics.ProcessingDuration(SourceWorker, time.Since(start))
+		}
 	}
 	return res, nil
 }

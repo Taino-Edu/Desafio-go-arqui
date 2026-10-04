@@ -25,16 +25,37 @@ var transientCodes = map[string]bool{
 	"53400": true, // configuration_limit_exceeded
 }
 
-// classify embrulha falhas temporárias com app.ErrTransient, preservando o
-// erro original para logs (errors.Is/As continuam funcionando nos dois).
+// conflictCodes são as falhas transitórias causadas por disputa de escrita.
+var conflictCodes = map[string]bool{
+	"40001": true, // serialization_failure
+	"40P01": true, // deadlock_detected
+	"55P03": true, // lock_not_available (lock_timeout)
+}
+
+// classify embrulha falhas temporárias com app.ErrTransient (e as disputas de
+// escrita também com app.ErrConcurrencyConflict), preservando o erro original
+// para logs (errors.Is/As continuam funcionando em todos).
 func classify(err error) error {
 	if err == nil || errors.Is(err, app.ErrTransient) {
 		return err
+	}
+	if isConflict(err) {
+		return conflict(err)
 	}
 	if isTransient(err) {
 		return fmt.Errorf("%w: %w", app.ErrTransient, err)
 	}
 	return err
+}
+
+// conflict marca err como disputa de escrita (transitória).
+func conflict(err error) error {
+	return fmt.Errorf("%w: %w: %w", app.ErrTransient, app.ErrConcurrencyConflict, err)
+}
+
+func isConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && conflictCodes[pgErr.Code]
 }
 
 func isTransient(err error) bool {

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,15 +48,43 @@ func Config(dbURL string) config.Config {
 	}
 }
 
-// QuietLogger descarta os logs JSON durante os testes.
-var QuietLogger = fx.Decorate(func(*slog.Logger) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(io.Discard, nil))
-})
-
 // App é a aplicação rodando para um teste.
 type App struct {
 	DB     *pgtest.DB
 	Client *Client
+	Logs   *LogBuffer // logs JSON da instância (nível INFO), para asserções
+}
+
+// LogBuffer guarda os logs JSON de uma instância. Seguro para goroutines: o
+// handler JSON do slog faz uma escrita por registro.
+type LogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *LogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// String devolve o texto bruto (para procurar o que NÃO pode aparecer).
+func (b *LogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Find devolve os registros cuja mensagem é msg.
+func (b *LogBuffer) Find(msg string) []map[string]any {
+	var out []map[string]any
+	for _, line := range strings.Split(b.String(), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) == nil && rec["msg"] == msg {
+			out = append(out, rec)
+		}
+	}
+	return out
 }
 
 // Start cria um banco descartável, sobe a aplicação e registra o shutdown.
@@ -75,12 +104,16 @@ func StartOn(t *testing.T, db *pgtest.DB, mutate func(*config.Config)) (*App, fu
 		mutate(&cfg)
 	}
 	var srv *httpapi.Server
-	app := fxtest.New(t, fxapp.New(cfg, QuietLogger, fx.Populate(&srv)))
+	logs := &LogBuffer{}
+	captured := fx.Decorate(func(*slog.Logger) *slog.Logger {
+		return fxapp.NewLogger(logs, slog.LevelInfo, cfg.InstanceID)
+	})
+	app := fxtest.New(t, fxapp.New(cfg, captured, fx.Populate(&srv)))
 	app.RequireStart()
 	var once sync.Once
 	stop := func() { once.Do(app.RequireStop) }
 	t.Cleanup(stop)
-	return &App{DB: db, Client: NewClient(t, "http://"+srv.Addr())}, stop
+	return &App{DB: db, Client: NewClient(t, "http://"+srv.Addr()), Logs: logs}, stop
 }
 
 // Client é um cliente HTTP mínimo para os testes.
@@ -138,9 +171,10 @@ func (c *Client) tokenFor(method, path string) string {
 // Base devolve o endereço base (ex.: http://127.0.0.1:8080).
 func (c *Client) Base() string { return c.base }
 
-// Response guarda status e corpo decodificado.
+// Response guarda status, cabeçalhos e corpo decodificado.
 type Response struct {
 	Status int
+	Header http.Header
 	Body   map[string]any
 }
 
@@ -187,7 +221,7 @@ func (c *Client) Do(method, path string, body any, headers ...string) Response {
 		return Response{}
 	}
 	defer resp.Body.Close()
-	out := Response{Status: resp.StatusCode}
+	out := Response{Status: resp.StatusCode, Header: resp.Header}
 	_ = json.NewDecoder(resp.Body).Decode(&out.Body)
 	return out
 }
@@ -271,6 +305,56 @@ func Count(t testing.TB, db *pgtest.DB, sql string, args ...any) int {
 		t.Fatalf("%s: %v", sql, err)
 	}
 	return n
+}
+
+// Metrics lê GET /metrics (público, sem token) e devolve o texto no formato
+// de exposição do Prometheus.
+func (c *Client) Metrics() string {
+	c.t.Helper()
+	resp, err := c.http.Get(c.base + "/metrics")
+	if err != nil {
+		c.t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		c.t.Fatalf("GET /metrics: %d %s", resp.StatusCode, b)
+	}
+	return string(b)
+}
+
+// MetricValue procura uma série exata no texto do /metrics, com os rótulos
+// em ordem alfabética, como o Prometheus os escreve. Exemplos:
+//
+//	reconciliation_mismatch_total
+//	wager_transactions_total{kind="BET",source="http",status="PROCESSED"}
+func MetricValue(text, series string) (float64, bool) {
+	for _, line := range strings.Split(text, "\n") {
+		rest, ok := strings.CutPrefix(line, series+" ")
+		if !ok {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(rest), 64)
+		return v, err == nil
+	}
+	return 0, false
+}
+
+// WaitMetric espera a série chegar a want (alguns contadores sobem logo
+// depois do efeito observável, como a remoção da mensagem da fila).
+func (c *Client) WaitMetric(series string, want float64, timeout time.Duration) {
+	c.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		got, ok := MetricValue(c.Metrics(), series)
+		if ok && got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatalf("métrica %s = %v (presente: %v), want %v", series, got, ok, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // Must falha o teste se o status não for o esperado.

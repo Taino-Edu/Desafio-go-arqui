@@ -11,7 +11,7 @@ correspondente é implementada (ver o roteiro em
 | [Carteira, ledger e transações](#carteira-ledger-e-transações) | ✅ |
 | [Banco, migrations e invariantes no schema](#banco-migrations-e-invariantes-no-schema) | ✅ |
 | [Transação SQL entre repositórios](#transação-sql-entre-repositórios) | ✅ |
-| [Contrato HTTP](#contrato-http) | ✅ (reconciliação na fase 10) |
+| [Contrato HTTP](#contrato-http) | ✅ |
 | [Idempotência](#idempotência) | ✅ HTTP e SQS |
 | [Concorrência e locks](#concorrência-e-locks) | ✅ |
 | [Referências pendentes e worker](#referências-pendentes-e-worker) | ✅ |
@@ -19,7 +19,8 @@ correspondente é implementada (ver o roteiro em
 | [Inbox, SQS e DLQ](#inbox-sqs-e-dlq) | ✅ |
 | [Outbox](#outbox-publicação-de-eventos) | ✅ |
 | [Uber Fx e shutdown](#uber-fx-ciclo-de-vida-e-shutdown) | ✅ HTTP, banco, worker de referências, consumidor SQS e publicador da outbox |
-| Observabilidade | ⏳ fase 10 |
+| [Reconciliação](#reconciliação) | ✅ |
+| [Observabilidade](#observabilidade-métricas-e-logs) | ✅ métricas Prometheus, logs JSON com contexto, health |
 
 ---
 
@@ -27,9 +28,11 @@ correspondente é implementada (ver o roteiro em
 
 ```
 internal/domain/         regras de negócio puras: stdlib + uuid
-internal/app/            casos de uso; define as portas (interfaces) de persistência
-internal/adapters/       implementações: postgres (pgx), httpapi (net/http); sqs e auth virão
+internal/app/            casos de uso; define as portas (interfaces): persistência, publicação, métricas
+internal/adapters/       implementações: postgres (pgx), httpapi (net/http), auth (OIDC),
+                         sqsconsumer (SQS: consumidor e publicador), observability (Prometheus, slog)
 internal/platform/       config (variáveis de ambiente) e fxapp (composição Uber Fx)
+internal/worker/         loop de trabalho em segundo plano (worker de referências, publicador)
 cmd/server, cmd/migrate  executáveis
 ```
 
@@ -296,7 +299,8 @@ Valem mesmo que o código Go tenha um bug ou que alguém acesse o banco direto.
 
 Com o encadeamento e a checagem adiada, o saldo armazenado é sempre igual ao
 último `balance_after` da cadeia de lançamentos, e a cadeia começa em zero.
-A reconciliação (fase 10) passa a ser uma prova, não só um alerta.
+A [reconciliação](#reconciliação) confere isso de fora, sob demanda, e
+detecta o que escapar das barreiras.
 
 ### Decisões e limitações
 
@@ -307,8 +311,11 @@ A reconciliação (fase 10) passa a ser uma prova, não só um alerta.
   dá a ordem estável usada pela paginação do ledger e encadeia os lançamentos.
 - Os triggers rodam antes das FKs; por isso uma transação inexistente no
   lançamento é barrada pelo trigger (`check_violation`), não pela FK.
-- Um superusuário ainda pode desligar triggers. A proteção é contra a
-  aplicação e contra o dono do schema em operação normal.
+- O dono do schema (e um superusuário) ainda pode desligar triggers com
+  `ALTER TABLE ... DISABLE TRIGGER`. A proteção é contra a aplicação
+  (`wallet_app` não é dona das tabelas) e contra erros em operação normal; o
+  que escapar disso, a reconciliação detecta. O teste de divergência faz
+  exatamente esse caminho.
 
 ### Ambiente local
 
@@ -376,7 +383,10 @@ removida do Go, o trigger do banco ainda barra a escrita.
 `postgres.classify` embrulha com `app.ErrTransient`: SQLSTATE `40001`
 (serialização), `40P01` (deadlock), `55P03` (`lock_timeout`), `57014`
 (`statement_timeout`), `57P0x`, `53300`, classe `08` (conexão), erros de rede
-e prazo do contexto. O HTTP responde `503` com `Retry-After`. O pool define
+e prazo do contexto. As disputas de escrita (`40001`, `40P01`, `55P03` e a
+versão desatualizada no `UPDATE`) recebem também `app.ErrConcurrencyConflict`,
+para serem contadas à parte (`wallet_lock_conflicts_total`). O HTTP responde
+`503` com `Retry-After`. O pool define
 `statement_timeout` (5s) e `lock_timeout` (3s) por conexão, menores que o prazo
 da requisição (10s), para que esperar por uma carteira disputada nunca segure
 uma requisição indefinidamente.
@@ -389,9 +399,10 @@ Arquivo: [`internal/platform/fxapp/fxapp.go`](internal/platform/fxapp/fxapp.go).
 
 | Módulo (`fx.Module`) | Fornece (`fx.Provide`) | Ciclo de vida (`fx.Lifecycle`) |
 |---|---|---|
-| `logging` | `*slog.Logger` JSON | — |
+| `logging` | `*slog.Logger` JSON (com o `ContextHandler`) | — |
+| `observability` | `*observability.Prometheus` e as portas `app.Metrics`, `sqsconsumer.Metrics`, `httpapi.Observability`; registra o coletor de pendências | — |
 | `postgres` | `*pgxpool.Pool`, `app.Store` | OnStart: ping (sem banco, não sobe). OnStop: fecha o pool |
-| `app` | `Clock`, `IDGenerator`, `WalletService` | — |
+| `app` | `Clock`, `IDGenerator`, `WalletService`, `WagerService` (com `app.WithMetrics`: o Fx ignora parâmetros variádicos, então a opção é passada explicitamente) | — |
 | `http` | `Health`, handler, `*httpapi.Server` | `fx.Invoke` registra OnStart (abre a porta) e OnStop (shutdown gracioso) |
 | `aws` (se consumidor ou publicador ligado) | cliente SQS compartilhado | — |
 | `outbox` (se `OUTBOX_PUBLISHER_ENABLED`) | — | OnStart resolve a fila de eventos (sem fila, não sobe) e inicia o loop; OnStop termina o lote em andamento (o que não for publicado volta quando o arrendamento vencer) |
@@ -435,7 +446,6 @@ Respostas de erro têm sempre o formato:
 | carteira já existe para jogador e moeda | `409` | `WALLET_ALREADY_EXISTS` |
 | indisponibilidade transitória (banco, lock, timeout) | `503` + `Retry-After: 1` | `TEMPORARILY_UNAVAILABLE` |
 | erro inesperado (detalhes só no log) | `500` | `INTERNAL_ERROR` |
-
 | chave de idempotência reutilizada com outro conteúdo | `409` | `IDEMPOTENCY_KEY_REUSED` |
 | `(providerId, externalTransactionId)` já registrado com outra chave | `409` | `DUPLICATE_TRANSACTION` |
 | transação inexistente | `404` | `NOT_FOUND` |
@@ -463,8 +473,10 @@ indisponibilidade transitória (`503`).
 | `POST /wagering/transactions` (header `Idempotency-Key` obrigatório) | ver tabela de desfechos |
 | `GET /wagering/transactions/{transactionId}` | `200` com estado, resultado, tentativas e referência |
 | `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` | `200` (mesma visão) |
+| `POST /wallets/{walletId}/reconciliation` | `200` com o resultado, inclusive divergente (ver [Reconciliação](#reconciliação)) |
 | `GET /health/live` | `200` sempre que o processo responde |
-| `GET /health/ready` | `200` com Postgres ok; `503` se indisponível ou desligando |
+| `GET /health/ready` | `200` com Postgres (e SQS, se ligado) ok; `503` se indisponível ou desligando |
+| `GET /metrics` | `200`, formato de exposição do Prometheus (público, ver [Observabilidade](#observabilidade-métricas-e-logs)) |
 
 - **Paginação:** ordem crescente de `walletVersion` (estável: lançamentos novos
   só entram no fim). O cursor é opaco (`base64url("v1:<versão>")`).
@@ -542,8 +554,10 @@ processos e vale entre instâncias diferentes.
 ### Repetição automática
 
 Diante de `ErrTransient` (lock, deadlock, conexão), o caso de uso tenta até 3
-vezes com espera crescente. É seguro porque é idempotente: se uma tentativa
-chegou a confirmar, a seguinte vira replay.
+vezes com espera crescente (20ms, 80ms). É seguro porque é idempotente: se uma
+tentativa chegou a confirmar, a seguinte vira replay. Cada nova tentativa
+conta em `transient_retries_total`, e cada disputa de escrita em
+`wallet_lock_conflicts_total`.
 
 ---
 
@@ -578,6 +592,7 @@ saldo negativo, mas o perdedor recebe `500` em vez de uma rejeição limpa.
 | `TestDifferentWalletsAreNotBlocked` | carteira A travada por outra conexão | aposta na carteira B conclui na hora |
 | `TestManyWalletsManyBetsInParallel` | 200 apostas em 20 carteiras | nenhum lost update |
 | `TestThreeIndependentInstances` | os cenários acima com **3 processos** do servidor (binário compilado, pools e memória próprios), requisições espalhadas entre eles | mesmos resultados; shutdown gracioso por SIGTERM |
+| `TestLockContention_IsCountedAndAnswered503` | outra conexão segura a carteira além do `lock_timeout` | 3 tentativas, 3 conflitos e 2 retries contados; `503` + `Retry-After`; nada gravado; a repetição do cliente processa uma vez |
 
 Todos terminam com a reconciliação de todas as carteiras (saldo = créditos −
 débitos do ledger) e rodam com `-race`. Foram repetidos 5 vezes seguidas sem
@@ -954,3 +969,163 @@ vir ou perdido no consumidor); valores monetários são strings decimais.
 Verificação adversarial registrada: removendo a regra da "cabeça" do
 agregado, os eventos de uma carteira chegaram na ordem `[8 9 1 2 3 4 5 6 7]`
 e os dois testes de ordem falharam.
+
+---
+
+## Reconciliação
+
+Arquivos: [`app/reconcile.go`](internal/app/reconcile.go),
+[`postgres/store.go`](internal/adapters/postgres/store.go) (`ReadSnapshot`),
+[`httpapi/wallets.go`](internal/adapters/httpapi/wallets.go).
+
+`POST /wallets/{walletId}/reconciliation`, só para `wallet-admin`:
+
+```json
+{
+  "walletId": "0192f291-27dd-7d3f-8071-5f8685deef37",
+  "storedBalance": { "amount": "975.00", "currency": "BRL" },
+  "calculatedBalance": { "amount": "975.00", "currency": "BRL" },
+  "difference": { "amount": "0.00", "currency": "BRL" },
+  "consistent": true,
+  "checkedEntries": 2
+}
+```
+
+- **Reconstrução:** `calculatedBalance = Σ créditos − Σ débitos` de **todos**
+  os lançamentos da carteira, abertura incluída (`SUM` com `FILTER` por
+  direção, num único `SELECT`). `difference = storedBalance − calculatedBalance`:
+  positiva quando a carteira tem dinheiro que o ledger não explica, negativa
+  quando falta. A aritmética usa `Money`: um estouro vira erro, nunca um número
+  errado.
+- **Visão consistente:** saldo e soma são lidos na **mesma foto** do banco:
+  transação `REPEATABLE READ` **somente leitura** (`Store.ReadSnapshot`). Em
+  `READ COMMITTED`, cada `SELECT` vê os dados confirmados até ele, e uma
+  aposta confirmada entre as duas leituras gera divergência falsa.
+- **Nada é alterado.** A transação é somente leitura e termina em `ROLLBACK`.
+  Divergência não é corrigida automaticamente: a correção é decisão humana,
+  com um lançamento novo (o ledger nunca é editado).
+- **Divergência é resultado, não erro:** a resposta é `200` com
+  `consistent: false`, e ela também vai para um log `ERROR`
+  (`reconciliation mismatch`, com `walletId`, `difference` e
+  `checkedEntries`, sem os saldos) e para a métrica
+  `reconciliation_mismatch_total`.
+- Carteira inexistente: `404`. Provedor: `403`.
+
+### Testes (`test/integration/observability_test.go`)
+
+| Teste | Comprova |
+|---|---|
+| `ConsistentWallet` | o exemplo do enunciado (abertura 1000.00 + aposta 25.00 → 975.00, 2 lançamentos); `403` para provedor, `401` sem token, `404`, `400`; carteira aberta com zero tem 0 lançamentos |
+| `ReportsDivergenceWithoutChangingAnything` | o dono da tabela desliga a checagem adiada e soma 10.00 ao saldo sem lançamento: resposta `difference: 10.00`, `consistent: false`; log `ERROR` com `walletId`, `difference` e `correlationId`; métrica `1`; saldo, versão, `updated_at` e ledger idênticos depois |
+| `UnderLoadHasNoFalseAlarms` | 200 apostas concorrentes e ~1500 reconciliações ao mesmo tempo: nenhuma divergência falsa |
+
+Experimento registrado: trocando `REPEATABLE READ` por `READ COMMITTED` na
+leitura, 91 de 1530 reconciliações sob carga acusaram divergência falsa
+(saldo 10000.00 × ledger 9999.00: uma aposta confirmou entre as duas
+leituras).
+
+---
+
+## Observabilidade: métricas e logs
+
+Arquivos: [`app/metrics.go`](internal/app/metrics.go) (porta),
+[`adapters/observability`](internal/adapters/observability) (Prometheus e
+slog), [`httpapi/observability.go`](internal/adapters/httpapi/observability.go).
+
+### Portas e adaptador
+
+Os casos de uso recebem a interface `app.Metrics` (com `NopMetrics` como
+padrão) pela opção `app.WithMetrics`; o consumidor SQS recebe
+`sqsconsumer.Metrics`; o HTTP recebe `httpapi.RequestObserver`. Nenhum deles
+importa o Prometheus: só `internal/adapters/observability` conhece a
+biblioteca, e um mesmo objeto implementa as três portas. O registry é
+**próprio** (nada global), então cada instância, inclusive as dos testes, tem
+as suas métricas.
+
+### Métricas (`GET /metrics`)
+
+| Métrica | Tipo | Rótulos | O que mede |
+|---|---|---|---|
+| `wager_transactions_total` | counter | `source`, `kind`, `status` | operações **novas** com desfecho gravado (`source`: `http`, `sqs`, `worker`) |
+| `idempotent_replays_total` | counter | `source` | duplicatas respondidas com o resultado salvo |
+| `idempotency_conflicts_total` | counter | `source`, `reason` | `key_reused` ou `duplicate_transaction` (`409`) |
+| `wager_processing_duration_seconds` | histogram | `source` | latência do caso de uso, com esperas por lock e retries (1ms a 10s) |
+| `transient_retries_total` | counter | `source` | novas tentativas automáticas |
+| `wallet_lock_conflicts_total` | counter | `source` | disputas de escrita (lock timeout, deadlock, serialização, versão) |
+| `sqs_messages_total` | counter | `outcome` | `processed`, `duplicate` (inbox), `retry`, `dlq`, `released` (desligamento) |
+| `sqs_queue_messages` | gauge | `queue` | mensagens visíveis na fila de entrada e na DLQ, lidas do SQS na coleta (inclui o que a redrive policy move para a DLQ) |
+| `outbox_events_total` | counter | `result` | publicações `published` e `failed` |
+| `outbox_pending_events` | gauge | — | eventos ainda não publicados |
+| `outbox_lag_seconds` | gauge | — | **atraso da outbox**: idade do evento não publicado mais antigo |
+| `wager_pending_references` | gauge | — | operações em `PENDING_REFERENCE` |
+| `reference_resolutions_total` | counter | `outcome` | rodadas do worker: `RESOLVED`, `RESCHEDULED`, `EXPIRED` |
+| `reconciliations_total` | counter | `result` | `consistent`, `divergent` |
+| `reconciliation_mismatch_total` | counter | — | divergências encontradas |
+| `http_requests_total` | counter | `method`, `route`, `status` | requisições HTTP |
+| `http_request_duration_seconds` | histogram | `method`, `route` | latência HTTP |
+| `go_*`, `process_*` | — | — | runtime Go e processo (memória, goroutines, CPU, descritores) |
+
+Decisões:
+
+- **Cardinalidade controlada.** Nenhum id vira rótulo. A rota é o **padrão**
+  do mux (`/wallets/{walletId}`), lido de `r.Pattern`; requisição sem rota é
+  `unmatched`; método fora da lista vira `OTHER`. Um rótulo por carteira
+  criaria uma série nova a cada carteira.
+- **Gauges lidos na hora da coleta.** Pendências da outbox, atraso e
+  referências pendentes são consultados no banco a cada coleta (índices
+  parciais, prazo de 2s). O valor é o do banco, igual em qualquer instância,
+  e não um contador local que cada instância teria diferente. No máximo duas
+  coletas simultâneas.
+- **Coleta que falha não derruba a página:** com o banco fora, `/metrics`
+  continua servindo as demais métricas (`ContinueOnError`) e o erro vai para
+  o log.
+- **Séries de rótulos fixos começam em zero** (`reconciliation_mismatch_total`,
+  `outbox_events_total`...), para que `rate()` e alertas funcionem desde a
+  partida.
+- **Contadores são por instância** (o Prometheus soma as instâncias com
+  `sum by`); os gauges do banco são globais.
+- **`/metrics` é público**, como os health checks: não expõe dados de negócio
+  nem ids. Em produção, fica restrito à rede interna (ou a uma porta de
+  administração) por configuração de rede, não pela aplicação.
+
+O middleware de métricas fica **colado no mux**: o mux grava o padrão casado
+no `*http.Request` que recebe, e um `r.WithContext` no meio (como o do
+timeout) cria uma cópia sem o padrão. Experimento registrado: com o
+middleware fora do lugar, todas as rotas viraram `unmatched` e o teste de
+métricas falhou. O `withRecover` fica dentro dele, para que um panic seja
+medido como `500`.
+
+### Logs
+
+- JSON (`slog.NewJSONHandler`) em stdout, com `service` e `instance` em toda
+  linha.
+- O `ContextHandler` acrescenta o `correlationId` do contexto a todo log
+  feito com ele (`InfoContext`, `ErrorContext`...), sem depender de cada
+  chamada lembrar de incluí-lo, e sem chave duplicada.
+- Identificadores por fluxo: HTTP com `correlationId` (do
+  `X-Correlation-Id` ou gerado), `transactionId`, `walletId` e `providerId`;
+  SQS com `messageId`, `sqsMessageId`, `providerId`, `walletId` e
+  `transactionId` (o `correlationId` da mensagem é o `messageId`); worker com
+  `transactionId`, `walletId` e `providerId`.
+- O worker conclui operações sem requisição de origem: os eventos dessa
+  conclusão levam o `transactionId` como `correlationId`, o que os liga ao
+  evento de pendência (que traz o mesmo `transactionId` nos dados).
+  Limitação: o `correlationId` da requisição original não é gravado na
+  transação.
+- **Nunca** vão para o log: token, cabeçalho `Authorization`, corpo da
+  requisição ou da mensagem, valores e saldos (a divergência da
+  reconciliação registra só a diferença).
+- Health checks e coletas de métricas são logados em `DEBUG` (chegam a cada
+  poucos segundos e afogariam os logs).
+
+### Testes
+
+| Teste | Comprova |
+|---|---|
+| `observability/prometheus_test.go` | cada método da porta vira a série esperada; séries fixas em zero; método normalizado; gauges lidos na coleta; coletor com erro não derruba a página |
+| `observability/logging_test.go` | `correlationId` do contexto em todo log, inclusive em loggers derivados (`With`), sem duplicar |
+| `httpapi/observability_test.go` | pela pilha completa de middlewares: rota = padrão, `unmatched` em 404/405, panic medido como 500 |
+| `app/metrics_test.go` | retries e conflitos contados por tentativa (conflito ≠ banco fora); aritmética da reconciliação |
+| `TestMetrics_ExposeOutcomesAndBacklog` | pela aplicação real: desfechos por status e porta, replay, conflito, latência, pendência resolvida pelo worker, atraso da outbox, rotas HTTP; nenhum id em `/metrics` |
+| `TestLogs_CarryIdentifiersAndNoSecrets` | `correlationId`, `transactionId`, `walletId`, `providerId` no log; token, `Bearer` e valores ausentes |
+| testes de SQS e outbox | `sqs_messages_total` por desfecho (processada, duplicata, DLQ), profundidade das filas, publicação da outbox com atraso zero no fim |

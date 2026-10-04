@@ -59,7 +59,7 @@ func (r walletRepo) Update(ctx context.Context, w *wallet.Wallet) error {
 		return classify(err)
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("%w: wallet %s was modified concurrently", app.ErrTransient, w.ID())
+		return conflict(fmt.Errorf("wallet %s was modified concurrently", w.ID()))
 	}
 	return nil
 }
@@ -201,6 +201,20 @@ func (r ledgerRepo) List(ctx context.Context, walletID uuid.UUID, afterVersion i
 	return out, classify(rows.Err())
 }
 
+// Totals soma o ledger inteiro da carteira. SUM de BIGINT devolve NUMERIC
+// (não estoura no banco); o cast para BIGINT falha com erro em vez de
+// truncar, se um dia a soma não couber em int64.
+func (r ledgerRepo) Totals(ctx context.Context, walletID uuid.UUID) (app.LedgerTotals, error) {
+	var t app.LedgerTotals
+	err := r.q.QueryRow(ctx, `
+		SELECT COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'CREDIT'), 0)::BIGINT,
+		       COALESCE(SUM(amount_minor) FILTER (WHERE direction = 'DEBIT'), 0)::BIGINT,
+		       COUNT(*)
+		  FROM wallet_ledger_entries
+		 WHERE wallet_id = $1`, walletID).Scan(&t.Credits, &t.Debits, &t.Entries)
+	return t, classify(err)
+}
+
 // ---------------------------------------------------------------------
 // outbox_events
 // ---------------------------------------------------------------------
@@ -317,7 +331,7 @@ func (r transactionRepo) Update(ctx context.Context, t *wagering.WagerTransactio
 	if c, ok := uniqueViolation(err); ok && c == "wager_tx_one_reversal_per_reference" {
 		// outra reversão da mesma referência confirmou antes: a nova tentativa
 		// verá a reversão existente e rejeitará com ALREADY_REVERSED
-		return fmt.Errorf("%w: reference reversed concurrently", app.ErrTransient)
+		return conflict(fmt.Errorf("reference reversed concurrently: %w", err))
 	}
 	if err != nil {
 		return classify(err)
@@ -419,6 +433,14 @@ func (r transactionRepo) NudgePendingReferences(ctx context.Context, providerID,
 			   AND status = 'PENDING_REFERENCE' AND next_attempt_at > $3
 			 FOR UPDATE SKIP LOCKED)`, providerID, externalID, now)
 	return classify(err)
+}
+
+// CountPendingReferences usa o índice parcial das pendências (wager_tx_due_idx).
+func (r transactionRepo) CountPendingReferences(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.q.QueryRow(ctx, `
+		SELECT COUNT(*) FROM wager_transactions WHERE status = 'PENDING_REFERENCE'`).Scan(&n)
+	return n, classify(err)
 }
 
 // ---------------------------------------------------------------------

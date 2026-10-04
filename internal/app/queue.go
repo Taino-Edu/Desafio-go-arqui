@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"time"
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/domainerr"
 )
@@ -45,6 +46,7 @@ func (s *WagerService) HandleQueueMessage(ctx context.Context, m QueueMessage) (
 	if m.Consumer == "" || m.MessageID == "" {
 		return QueueOutcome{}, domainerr.Field("messageId", "required")
 	}
+	start := time.Now()
 	kind, bizHash, err := prepare(m.Input)
 	if err != nil {
 		return QueueOutcome{}, err
@@ -54,7 +56,8 @@ func (s *WagerService) HandleQueueMessage(ctx context.Context, m QueueMessage) (
 	msgHash := hex.EncodeToString(sum[:])
 
 	var out QueueOutcome
-	err = s.retryTransient(ctx, func() error {
+	err = s.retryTransient(ctx, SourceSQS, func() error {
+		out = QueueOutcome{} // nada de uma tentativa desfeita sobrevive
 		return s.store.WithinTx(ctx, func(ctx context.Context, r Repositories) error {
 			now := s.clock.Now()
 			existing, inserted, err := r.Inbox().Register(ctx, m.Consumer, m.MessageID, msgHash, now)
@@ -81,7 +84,15 @@ func (s *WagerService) HandleQueueMessage(ctx context.Context, m QueueMessage) (
 			return nil
 		})
 	})
-	return out, err
+	if err != nil {
+		s.observe(SourceSQS, SubmitResult{}, err, start)
+		return QueueOutcome{}, err
+	}
+	// reentregas (Duplicate) são contadas pelo consumidor, que as reconhece
+	if out.Result != nil {
+		s.observe(SourceSQS, *out.Result, nil, start)
+	}
+	return out, nil
 }
 
 // IsPermanentQueueError informa se o erro nunca vai se resolver tentando de

@@ -13,6 +13,8 @@ package fxapp
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/auth"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/httpapi"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/observability"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/postgres"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/sqsconsumer"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
@@ -45,6 +48,7 @@ func New(cfg config.Config, extra ...fx.Option) fx.Option {
 		fx.WithLogger(func(l *slog.Logger) fxevent.Logger {
 			return &fxevent.SlogLogger{Logger: l.With("component", "fx")}
 		}),
+		ObservabilityModule,
 		PostgresModule,
 		AppModule,
 		HTTPModule,
@@ -59,10 +63,40 @@ func New(cfg config.Config, extra ...fx.Option) fx.Option {
 // LoggingModule: logs JSON em stdout.
 var LoggingModule = fx.Module("logging",
 	fx.Provide(func(cfg config.Config) *slog.Logger {
-		h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel})
-		return slog.New(h).With("service", "wallet", "instance", cfg.InstanceID)
+		return NewLogger(os.Stdout, cfg.LogLevel, cfg.InstanceID)
 	}),
 )
+
+// NewLogger cria o logger da aplicação: JSON em w, com service e instance em
+// toda linha. O ContextHandler acrescenta o correlationId do contexto a todo
+// log feito com ele (InfoContext, ErrorContext...).
+func NewLogger(w io.Writer, level slog.Level, instanceID string) *slog.Logger {
+	h := slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})
+	return slog.New(observability.NewContextHandler(h)).With("service", "wallet", "instance", instanceID)
+}
+
+// ObservabilityModule: métricas Prometheus num registry próprio, servidas
+// em GET /metrics. Os casos de uso recebem a porta app.Metrics; o consumidor
+// SQS e o HTTP recebem as suas portas; nenhum deles conhece o Prometheus.
+var ObservabilityModule = fx.Module("observability",
+	fx.Provide(
+		observability.NewPrometheus,
+		func(p *observability.Prometheus) app.Metrics { return p },
+		func(p *observability.Prometheus) sqsconsumer.Metrics { return p },
+		func(p *observability.Prometheus, log *slog.Logger) httpapi.Observability {
+			return httpapi.Observability{Requests: p, MetricsHandler: p.Handler(log)}
+		},
+	),
+	// atraso da outbox e pendências: lidos do banco a cada coleta
+	fx.Invoke(func(p *observability.Prometheus, store app.Store) error {
+		return p.RegisterBacklog(func(ctx context.Context) (app.Backlog, error) {
+			return app.ReadBacklog(ctx, store)
+		}, collectTimeout)
+	}),
+)
+
+// collectTimeout limita cada consulta feita durante uma coleta de métricas.
+const collectTimeout = 2 * time.Second
 
 // PostgresModule: pool de conexões e Store transacional.
 var PostgresModule = fx.Module("postgres",
@@ -99,12 +133,16 @@ func newPool(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (*pgxpool.Poo
 	return pool, nil
 }
 
-// AppModule: casos de uso.
+// AppModule: casos de uso. Os construtores recebem as métricas como opção
+// (app.WithMetrics); o Fx ignora parâmetros variádicos, então a injeção é
+// explícita aqui.
 var AppModule = fx.Module("app",
 	fx.Provide(
 		func() app.Clock { return app.SystemClock{} },
 		func() app.IDGenerator { return app.UUIDv7{} },
-		app.NewWalletService,
+		func(s app.Store, c app.Clock, ids app.IDGenerator, m app.Metrics) *app.WalletService {
+			return app.NewWalletService(s, c, ids, app.WithMetrics(m))
+		},
 		func(cfg config.Config) (wagering.ReferenceRetryPolicy, error) {
 			p := wagering.ReferenceRetryPolicy{
 				BaseDelay: cfg.References.BaseDelay, MaxDelay: cfg.References.MaxDelay,
@@ -112,7 +150,9 @@ var AppModule = fx.Module("app",
 			}
 			return p, p.Validate()
 		},
-		app.NewWagerService,
+		func(s app.Store, c app.Clock, ids app.IDGenerator, p wagering.ReferenceRetryPolicy, m app.Metrics) *app.WagerService {
+			return app.NewWagerService(s, c, ids, p, app.WithMetrics(m))
+		},
 	),
 )
 
@@ -201,7 +241,7 @@ func outboxModule(cfg config.Config) fx.Option {
 }
 
 func registerOutboxPublisher(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, store app.Store,
-	clock app.Clock, log *slog.Logger) {
+	clock app.Clock, metrics app.Metrics, log *slog.Logger) {
 	var eventsURL atomic.Pointer[string]
 	svc := app.NewOutboxService(store,
 		sqsconsumer.Publisher{API: client, QueueURL: func() string {
@@ -213,7 +253,7 @@ func registerOutboxPublisher(lc fx.Lifecycle, cfg config.Config, client *sqs.Cli
 		clock, app.OutboxConfig{
 			Owner: cfg.InstanceID, BatchSize: cfg.Outbox.BatchSize, Lease: cfg.Outbox.Lease,
 			RetryBase: cfg.Outbox.RetryBaseDelay, RetryMax: cfg.Outbox.RetryMaxDelay,
-		}, app.OutboxHooks{})
+		}, app.OutboxHooks{}, app.WithMetrics(metrics))
 
 	loop := worker.New(worker.Config{
 		Name: "outbox-publisher", Interval: cfg.Outbox.PollInterval,
@@ -255,7 +295,7 @@ func sqsModule(cfg config.Config) fx.Option {
 				fx.ResultTags(`group:"readiness"`),
 			),
 		),
-		fx.Invoke(registerSQSConsumer),
+		fx.Invoke(registerSQSConsumer, registerQueueDepth),
 	)
 }
 
@@ -271,8 +311,35 @@ func (q *sqsQueues) inputURL() string {
 	return q.input
 }
 
+func (q *sqsQueues) urls() (input, dlq string) {
+	q.mu.RLock()
+	defer q.mu.RUnlock()
+	return q.input, q.dlq
+}
+
+// registerQueueDepth expõe quantas mensagens esperam na fila de entrada e
+// na DLQ, lidas do SQS a cada coleta. A DLQ inclui o que o próprio SQS move
+// pela redrive policy, que o consumidor não vê.
+func registerQueueDepth(p *observability.Prometheus, client *sqs.Client, queues *sqsQueues) error {
+	return p.RegisterQueueDepth(func(ctx context.Context) (map[string]int64, error) {
+		input, dlq := queues.urls()
+		if input == "" || dlq == "" {
+			return nil, errors.New("sqs queues not resolved yet")
+		}
+		depths := map[string]int64{}
+		for name, url := range map[string]string{"input": input, "dlq": dlq} {
+			n, err := sqsconsumer.QueueDepth(ctx, client, url)
+			if err != nil {
+				return nil, err
+			}
+			depths[name] = n
+		}
+		return depths, nil
+	}, collectTimeout)
+}
+
 func registerSQSConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, queues *sqsQueues,
-	svc *app.WagerService, log *slog.Logger) {
+	svc *app.WagerService, metrics sqsconsumer.Metrics, log *slog.Logger) {
 	var consumer *sqsconsumer.Consumer
 	lc.Append(fx.Hook{
 		// valida a dependência na partida: as filas precisam existir
@@ -297,7 +364,7 @@ func registerSQSConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client,
 				ConsumerName: cfg.SQS.ConsumerName, QueueURL: input, DLQURL: dlq,
 				Pollers: cfg.SQS.Pollers, MaxMessages: int32(cfg.SQS.MaxMessages), WaitTime: cfg.SQS.WaitTime,
 				ItemTimeout: cfg.HTTP.RequestTimeout, RetryBaseDelay: cfg.SQS.RetryBaseDelay,
-				RetryMaxDelay: cfg.SQS.RetryMaxDelay, AllowedProviders: allowed,
+				RetryMaxDelay: cfg.SQS.RetryMaxDelay, AllowedProviders: allowed, Metrics: metrics,
 			}, client, svc, log, sqsconsumer.Hooks{})
 			return consumer.Start(ctx)
 		},

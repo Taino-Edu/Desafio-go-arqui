@@ -115,6 +115,12 @@ func TestSQS_ProcessesAndDeletesAfterCommit(t *testing.T) {
 	if n := apptest.Count(t, f.db, `SELECT count(*) FROM outbox_events WHERE correlation_id = 'msg-1'`); n != 2 {
 		t.Errorf("eventos com correlationId = %d", n)
 	}
+	// métricas: desfecho da mensagem, da operação, e as filas vazias
+	c := f.app.Client
+	c.WaitMetric(`sqs_messages_total{outcome="processed"}`, 1, 5*time.Second)
+	c.WaitMetric(`wager_transactions_total{kind="BET",source="sqs",status="PROCESSED"}`, 1, time.Second)
+	c.WaitMetric(`sqs_queue_messages{queue="input"}`, 0, 5*time.Second)
+	c.WaitMetric(`sqs_queue_messages{queue="dlq"}`, 0, time.Second)
 }
 
 // Reentrega da mesma mensagem (inbox) e mesma operação em outra mensagem
@@ -138,6 +144,13 @@ func TestSQS_DuplicatesAreDeduplicated(t *testing.T) {
 	if f.q.Depth(true) != 0 {
 		t.Error("duplicatas não são erro: nada na DLQ")
 	}
+	// as duas formas de duplicata aparecem separadas nas métricas: a
+	// reentrega (inbox) e a mesma operação em outra mensagem (replay)
+	c := f.app.Client
+	c.WaitMetric(`sqs_messages_total{outcome="duplicate"}`, 1, 5*time.Second)
+	c.WaitMetric(`sqs_messages_total{outcome="processed"}`, 2, 5*time.Second)
+	c.WaitMetric(`idempotent_replays_total{source="sqs"}`, 1, time.Second)
+	c.WaitMetric(`wager_transactions_total{kind="BET",source="sqs",status="PROCESSED"}`, 1, time.Second)
 }
 
 // A mesma operação pelas duas portas: HTTP e SQS compartilham a idempotência.
@@ -215,6 +228,7 @@ func TestSQS_InvalidMessagesGoToDLQ(t *testing.T) {
 	if n := apptest.Count(t, f.db, `SELECT count(*) FROM wager_transactions WHERE origin = 'EXTERNAL'`); n != 0 {
 		t.Errorf("mensagens inválidas gravaram %d transações", n)
 	}
+	f.app.Client.WaitMetric(`sqs_messages_total{outcome="dlq"}`, 4, 5*time.Second)
 }
 
 func TestSQS_SameMessageIDWithDifferentContent(t *testing.T) {

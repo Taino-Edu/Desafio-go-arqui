@@ -56,7 +56,26 @@ type Config struct {
 	RetryBaseDelay   time.Duration // backoff da visibilidade em erro transitório
 	RetryMaxDelay    time.Duration
 	AllowedProviders map[string]bool // vazio = qualquer provedor
+	Metrics          Metrics         // nil = sem métricas
 }
+
+// Metrics recebe o desfecho de cada mensagem recebida.
+type Metrics interface {
+	QueueMessage(outcome string)
+}
+
+// Desfechos de uma mensagem (rótulo "outcome").
+const (
+	OutcomeProcessed = "processed" // tratada e apagada
+	OutcomeDuplicate = "duplicate" // reentrega reconhecida pela inbox e apagada
+	OutcomeRetry     = "retry"     // falha transitória: volta para a fila com atraso
+	OutcomeDLQ       = "dlq"       // erro permanente: enviada à DLQ pelo consumidor
+	OutcomeReleased  = "released"  // não iniciada no desligamento: devolvida já
+)
+
+type nopMetrics struct{}
+
+func (nopMetrics) QueueMessage(string) {}
 
 // Hooks permitem aos testes simular falhas em pontos exatos. Em produção
 // são nil.
@@ -94,6 +113,9 @@ func New(cfg Config, api API, handler Handler, log *slog.Logger, hooks Hooks) *C
 	}
 	if cfg.MaxMessages < 1 || cfg.MaxMessages > 10 {
 		cfg.MaxMessages = 10
+	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = nopMetrics{}
 	}
 	return &Consumer{cfg: cfg, api: api, handler: handler, hooks: hooks,
 		log: log.With("component", "sqs-consumer", "queue", cfg.QueueURL), stop: make(chan struct{})}
@@ -229,9 +251,11 @@ func (c *Consumer) handle(workCtx context.Context, m types.Message) {
 	}
 	c.delete(m, log)
 	if out.Duplicate {
+		c.cfg.Metrics.QueueMessage(OutcomeDuplicate)
 		log.Info("duplicate message acknowledged (inbox)")
 		return
 	}
+	c.cfg.Metrics.QueueMessage(OutcomeProcessed)
 	tx := out.Result.Transaction
 	log.Info("queue message processed", "transactionId", tx.ID(), "status", tx.Status(),
 		"failureCode", tx.FailureCode(), "idempotentReplay", out.Result.Replay)
@@ -260,6 +284,7 @@ func (c *Consumer) retryLater(m types.Message, cause error, log *slog.Logger) {
 	if c.stopping() {
 		delay = 0 // desligando: libera já para outra instância
 	}
+	c.cfg.Metrics.QueueMessage(OutcomeRetry)
 	log.Warn("transient failure; message will be redelivered", "error", cause, "retryIn", delay.String())
 	ctx, cancel := shortCtx()
 	defer cancel()
@@ -279,6 +304,7 @@ func (c *Consumer) release(ms []types.Message) {
 		_, _ = c.api.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 			QueueUrl: aws.String(c.cfg.QueueURL), ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: 0,
 		})
+		c.cfg.Metrics.QueueMessage(OutcomeReleased)
 	}
 	if len(ms) > 0 {
 		c.log.Info("released unstarted messages on shutdown", "count", len(ms))
@@ -312,6 +338,7 @@ func (c *Consumer) toDLQ(m types.Message, cause error, log *slog.Logger) {
 		c.retryLater(m, fmt.Errorf("dlq send failed: %w (original: %v)", err, cause), log)
 		return
 	}
+	c.cfg.Metrics.QueueMessage(OutcomeDLQ)
 	log.Warn("message sent to DLQ", "reason", reason)
 	c.delete(m, log)
 }

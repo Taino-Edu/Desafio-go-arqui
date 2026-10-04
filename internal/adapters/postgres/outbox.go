@@ -90,6 +90,20 @@ func (r outboxRepo) MarkPublished(ctx context.Context, eventID uuid.UUID, now ti
 	return classify(err)
 }
 
+// Backlog usa o índice parcial dos não publicados (published_at IS NULL).
+func (r outboxRepo) Backlog(ctx context.Context) (int64, *time.Time, error) {
+	var (
+		n      int64
+		oldest *time.Time
+	)
+	err := r.q.QueryRow(ctx, `
+		SELECT COUNT(*), MIN(occurred_at) FROM outbox_events WHERE published_at IS NULL`).Scan(&n, &oldest)
+	if err != nil {
+		return 0, nil, classify(err)
+	}
+	return n, oldest, nil
+}
+
 func (r outboxRepo) MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, next time.Time, cause string) error {
 	if len(cause) > 1000 {
 		cause = cause[:1000]

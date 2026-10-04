@@ -23,13 +23,15 @@ const (
 
 // WalletService reúne os casos de uso de carteira.
 type WalletService struct {
-	store Store
-	clock Clock
-	ids   IDGenerator
+	store   Store
+	clock   Clock
+	ids     IDGenerator
+	metrics Metrics
 }
 
-func NewWalletService(store Store, clock Clock, ids IDGenerator) *WalletService {
-	return &WalletService{store: store, clock: clock, ids: ids}
+func NewWalletService(store Store, clock Clock, ids IDGenerator, opts ...Option) *WalletService {
+	o := applyOptions(opts)
+	return &WalletService{store: store, clock: clock, ids: ids, metrics: o.metrics}
 }
 
 // OpenWalletInput são os dados de abertura.

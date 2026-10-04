@@ -30,8 +30,7 @@ func withAuth(v TokenVerifier, log *slog.Logger, next http.Handler) http.Handler
 		if err != nil {
 			if errors.Is(err, app.ErrUnauthenticated) {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="wallet", error="invalid_token"`)
-				log.InfoContext(r.Context(), "authentication rejected", "reason", err.Error(),
-					"correlationId", app.CorrelationID(r.Context()))
+				log.InfoContext(r.Context(), "authentication rejected", "reason", err.Error())
 			}
 			writeError(w, r, log, err)
 			return

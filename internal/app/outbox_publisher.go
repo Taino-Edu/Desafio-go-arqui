@@ -33,10 +33,12 @@ type OutboxService struct {
 	clock     Clock
 	cfg       OutboxConfig
 	hooks     OutboxHooks
+	metrics   Metrics
 }
 
-func NewOutboxService(store Store, publisher EventPublisher, clock Clock, cfg OutboxConfig, hooks OutboxHooks) *OutboxService {
-	return &OutboxService{store: store, publisher: publisher, clock: clock, cfg: cfg, hooks: hooks}
+func NewOutboxService(store Store, publisher EventPublisher, clock Clock, cfg OutboxConfig, hooks OutboxHooks, opts ...Option) *OutboxService {
+	o := applyOptions(opts)
+	return &OutboxService{store: store, publisher: publisher, clock: clock, cfg: cfg, hooks: hooks, metrics: o.metrics}
 }
 
 // PublishResult resume uma rodada.
@@ -60,7 +62,15 @@ type PublishResult struct {
 // Entrega at-least-once: se o processo cair entre publicar e marcar, o
 // arrendamento vence e outra instância republica o MESMO evento, com o
 // MESMO eventId. Os consumidores deduplicam por eventId.
-func (s *OutboxService) PublishBatch(ctx context.Context) (PublishResult, error) {
+func (s *OutboxService) PublishBatch(ctx context.Context) (res PublishResult, err error) {
+	defer func() {
+		s.metrics.OutboxPublished(res.Published)
+		s.metrics.OutboxFailed(res.Failed)
+	}()
+	return s.publishBatch(ctx)
+}
+
+func (s *OutboxService) publishBatch(ctx context.Context) (PublishResult, error) {
 	var claimed []OutboxMessage
 	err := s.store.WithinTx(ctx, func(ctx context.Context, r Repositories) error {
 		var err error
