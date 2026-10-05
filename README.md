@@ -11,6 +11,7 @@ com várias instâncias ao mesmo tempo.
 |---|---|
 | dinheiro exato | `int64` em centavos, `Money` imutável, texto decimal canônico (`"25.00"`) |
 | extrato auditável | ledger append-only encadeado; o banco recusa edição e confere saldo = ledger no `COMMIT` |
+| partidas dobradas | todo lançamento tem contrapartida (caixa ou provedor) e Σ débitos = Σ créditos; o banco confere ledger = razão no `COMMIT`; balancete pela API |
 | sem duplicidade | idempotência persistida por `(provedor, chave)` e `(provedor, id externo)` + inbox para a fila |
 | sem lost update | `SELECT ... FOR UPDATE` por carteira + versão no `UPDATE` + triggers; nenhum lock em memória |
 | eventos confiáveis | transactional outbox: gravados no mesmo commit, publicados depois, at-least-once |
@@ -123,8 +124,11 @@ curl -s localhost:8080/wagering/transactions/<transactionId> -H "Authorization: 
 curl -s localhost:8080/wallets/<walletId> -H "Authorization: Bearer $ADMIN"
 curl -s 'localhost:8080/wallets/<walletId>/ledger?limit=50' -H "Authorization: Bearer $ADMIN"
 
-# reconciliação: saldo armazenado x saldo reconstruído pelo ledger (não altera nada)
+# reconciliação: saldo armazenado x ledger x razão em partidas dobradas (não altera nada)
 curl -s -X POST localhost:8080/wallets/<walletId>/reconciliation -H "Authorization: Bearer $ADMIN"
+
+# balancete: Σ débitos = Σ créditos; caixa, GGR por provedor e passivo com os jogadores
+curl -s 'localhost:8080/accounting/trial-balance?currency=BRL' -H "Authorization: Bearer $ADMIN"
 
 curl -s localhost:8080/health/ready   # público
 curl -s localhost:8080/metrics        # público, formato Prometheus
@@ -253,10 +257,18 @@ O serviço `migrate` do compose aplica tudo ao subir. Manualmente:
 ```sh
 export MIGRATE_DATABASE_URL='postgres://wallet_owner:wallet_owner@localhost:5432/wallet?sslmode=disable'
 go run ./cmd/migrate up        # aplica as pendentes
+go run ./cmd/migrate to 5      # leva o schema até a versão 5 (aplica ou reverte)
 go run ./cmd/migrate down 1    # reverte a última
 go run ./cmd/migrate down all  # reverte tudo (apaga os dados)
 go run ./cmd/migrate version
 ```
+
+Atualizando um ambiente **com instâncias no ar** a partir de uma versão
+anterior ao razão em partidas dobradas: `to 5` (cria as tabelas novas; as
+instâncias antigas seguem funcionando), deploy da aplicação em todas as
+instâncias, `up` (preenche o histórico e passa a exigir o razão; pausa as
+escritas de dinheiro por alguns segundos). Detalhes e medições em
+[ARCHITECTURE.md](ARCHITECTURE.md#migration-em-duas-etapas-expandir--contrair).
 
 ## Testes
 
@@ -347,6 +359,7 @@ internal/domain/
   money/                     value object Money (centavos em int64, sem float)
   wallet/                    carteira (raiz do agregado) e lançamento de ledger
   wagering/                  transação de aposta, máquina de estados e regras dos 5 tipos
+  accounting/                razão em partidas dobradas: plano de contas e lançamento balanceado
   events/                    eventos de integração e envelope
   domainerr/                 erros de validação compartilhados
 internal/app/                casos de uso e portas (interfaces)
@@ -364,7 +377,8 @@ internal/testsupport/idptest/ obtém tokens do Keycloak (client_credentials) par
 internal/testsupport/sqstest/ filas FIFO descartáveis no LocalStack para os testes
 internal/testsupport/chaostest/ proxy TCP cortável: simula Postgres ou SQS fora do ar
 test/integration/            ponta a ponta: regras, idempotência, concorrência, 3 instâncias, SQS,
-                             outbox, reconciliação, métricas, logs, caos (kill -9, dependências fora)
+                             outbox, reconciliação, partidas dobradas, métricas, logs, traces,
+                             caos (kill -9, dependências fora)
 migrations/                  SQL versionado (up/down)
 deploy/                      scripts do Postgres, LocalStack e realm do Keycloak
 scripts/demo.sh              demonstração ponta a ponta contra o compose

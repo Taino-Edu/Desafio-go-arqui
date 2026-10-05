@@ -1,6 +1,7 @@
 // Comando migrate aplica ou reverte as migrations do banco.
 //
 //	go run ./cmd/migrate up
+//	go run ./cmd/migrate to 5      # leva o schema até a versão 5 (implantação em etapas)
 //	go run ./cmd/migrate down 1     # reverte a última migration
 //	go run ./cmd/migrate down all   # reverte tudo (apaga os dados!)
 //	go run ./cmd/migrate version
@@ -29,12 +30,23 @@ func run(args []string) error {
 		return fmt.Errorf("MIGRATE_DATABASE_URL is required")
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("usage: migrate up | down <n|all> | version")
+		return fmt.Errorf("usage: migrate up | to <version> | down <n|all> | version")
 	}
 
 	switch args[0] {
 	case "up":
 		if err := postgres.MigrateUp(dbURL); err != nil {
+			return err
+		}
+	case "to":
+		if len(args) < 2 {
+			return fmt.Errorf("to requires a version")
+		}
+		v, err := strconv.ParseUint(args[1], 10, 32)
+		if err != nil || v < 1 {
+			return fmt.Errorf("invalid version %q", args[1])
+		}
+		if err := postgres.MigrateTo(dbURL, uint(v)); err != nil {
 			return err
 		}
 	case "down":

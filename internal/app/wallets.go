@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/accounting"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/events"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/money"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
@@ -42,7 +43,7 @@ type OpenWalletInput struct {
 
 // OpenWallet abre uma carteira. Com saldo inicial positivo, grava no MESMO
 // commit: a carteira, a transação OPENING (PROCESSED), o lançamento de
-// crédito e os eventos WagerTransactionProcessed e WalletBalanceChanged na
+// crédito, as partidas dobradas (caixa / carteira) e os eventos WagerTransactionProcessed e WalletBalanceChanged na
 // outbox. Com saldo zero, grava só a carteira.
 func (s *WalletService) OpenWallet(ctx context.Context, in OpenWalletInput) (*wallet.Wallet, error) {
 	walletID, err := s.ids.NewID()
@@ -75,6 +76,14 @@ func (s *WalletService) OpenWallet(ctx context.Context, in OpenWalletInput) (*wa
 		}
 	}
 
+	// partidas dobradas: D cash / C wallet (o dinheiro entrou na plataforma)
+	var journal accounting.JournalEntry
+	if opening != nil {
+		if journal, err = accounting.ForTransaction(opening, *entry); err != nil {
+			return nil, err
+		}
+	}
+
 	// eventos na ordem em que aconteceram: a operação, depois o saldo
 	var evs []events.Event
 	if opening != nil {
@@ -101,6 +110,9 @@ func (s *WalletService) OpenWallet(ctx context.Context, in OpenWalletInput) (*wa
 			return err
 		}
 		if err := r.Ledger().Insert(ctx, *entry); err != nil {
+			return err
+		}
+		if err := r.Journal().Post(ctx, journal); err != nil {
 			return err
 		}
 		return r.Outbox().Append(ctx, records...)

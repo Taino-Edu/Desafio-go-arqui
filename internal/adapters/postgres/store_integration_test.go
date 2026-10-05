@@ -14,6 +14,7 @@ import (
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/adapters/postgres"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/accounting"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/money"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/testsupport/pgtest"
@@ -68,7 +69,14 @@ func bet(ctx context.Context, store app.Store, walletID uuid.UUID, extID, amount
 		if err := r.Wallets().Update(ctx, w); err != nil {
 			return err
 		}
-		return r.Ledger().Insert(ctx, *out.Entry)
+		if err := r.Ledger().Insert(ctx, *out.Entry); err != nil {
+			return err
+		}
+		journal, err := accounting.ForTransaction(tx, *out.Entry)
+		if err != nil {
+			return err
+		}
+		return r.Journal().Post(ctx, journal)
 	})
 }
 

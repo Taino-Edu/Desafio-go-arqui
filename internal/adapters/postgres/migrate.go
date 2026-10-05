@@ -51,6 +51,20 @@ func MigrateUp(databaseURL string) (err error) {
 	return nil
 }
 
+// MigrateTo leva o schema exatamente até version (aplica ou reverte). Usado
+// em implantações em etapas: expandir, publicar a aplicação, contrair.
+func MigrateTo(databaseURL string, version uint) (err error) {
+	m, err := newMigrator(databaseURL)
+	if err != nil {
+		return err
+	}
+	defer func() { err = closeMigrator(m, err) }()
+	if err := m.Migrate(version); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("migrate to %d: %w", version, err)
+	}
+	return nil
+}
+
 // MigrateDown reverte `steps` migrations (todas, se steps <= 0).
 func MigrateDown(databaseURL string, steps int) (err error) {
 	m, err := newMigrator(databaseURL)

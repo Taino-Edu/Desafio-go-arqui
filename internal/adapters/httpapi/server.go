@@ -44,6 +44,7 @@ func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers
 	mux.Handle("GET /wallets/{walletId}", protect(wh.get))
 	mux.Handle("GET /wallets/{walletId}/ledger", protect(wh.ledger))
 	mux.Handle("POST /wallets/{walletId}/reconciliation", protect(wh.reconcile))
+	mux.Handle("GET /accounting/trial-balance", protect(wh.trialBalance))
 
 	mux.Handle("POST /wagering/transactions", protect(gh.submit))
 	mux.Handle("GET /wagering/transactions/{transactionId}", protect(gh.getByID))

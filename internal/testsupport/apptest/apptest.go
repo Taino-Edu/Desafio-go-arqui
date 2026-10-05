@@ -296,27 +296,53 @@ func (c *Client) TrySubmit(o Op) (Response, error) {
 }
 
 // AssertReconciled confere, para TODAS as carteiras, que o saldo armazenado
-// é igual a créditos menos débitos do ledger.
+// é igual a créditos menos débitos do ledger E ao saldo da conta da carteira
+// no razão em partidas dobradas; e que o razão inteiro fecha: cada
+// lançamento e cada moeda com Σ débitos = Σ créditos. Os testes de
+// concorrência, caos e multi-instância chamam esta função no fim, então o
+// razão é conferido em todos esses cenários.
 func AssertReconciled(t testing.TB, db *pgtest.DB) {
 	t.Helper()
-	rows, err := db.Owner.Query(context.Background(), `
+	c := context.Background()
+	rows, err := db.Owner.Query(c, `
 		SELECT w.id, w.balance_minor,
-		       COALESCE(SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount_minor ELSE -l.amount_minor END), 0)
-		  FROM wallets w LEFT JOIN wallet_ledger_entries l ON l.wallet_id = w.id
-		 GROUP BY w.id, w.balance_minor`)
+		       COALESCE((SELECT SUM(CASE l.direction WHEN 'CREDIT' THEN l.amount_minor ELSE -l.amount_minor END)
+		                   FROM wallet_ledger_entries l WHERE l.wallet_id = w.id), 0)::BIGINT,
+		       COALESCE((SELECT SUM(CASE p.direction WHEN 'CREDIT' THEN p.amount_minor ELSE -p.amount_minor END)
+		                   FROM journal_postings p WHERE p.account_code = 'wallet:' || w.id::text), 0)::BIGINT
+		  FROM wallets w`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id string
-		var stored, fromLedger int64
-		if err := rows.Scan(&id, &stored, &fromLedger); err != nil {
+		var stored, fromLedger, fromJournal int64
+		if err := rows.Scan(&id, &stored, &fromLedger, &fromJournal); err != nil {
 			t.Fatal(err)
 		}
-		if stored != fromLedger {
-			t.Errorf("carteira %s: saldo %d != ledger %d", id, stored, fromLedger)
+		if stored != fromLedger || stored != fromJournal {
+			t.Errorf("carteira %s: saldo %d, ledger %d, razão %d", id, stored, fromLedger, fromJournal)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	var unbalancedEntries, unbalancedCurrencies int
+	err = db.Owner.QueryRow(c, `
+		SELECT (SELECT count(*) FROM (
+		          SELECT 1 FROM journal_postings GROUP BY transaction_id
+		          HAVING SUM(CASE direction WHEN 'DEBIT' THEN amount_minor ELSE -amount_minor END) <> 0) e),
+		       (SELECT count(*) FROM (
+		          SELECT 1 FROM journal_postings GROUP BY currency
+		          HAVING SUM(CASE direction WHEN 'DEBIT' THEN amount_minor ELSE -amount_minor END) <> 0) m)`).
+		Scan(&unbalancedEntries, &unbalancedCurrencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unbalancedEntries != 0 || unbalancedCurrencies != 0 {
+		t.Errorf("razão não fecha: %d lançamentos e %d moedas com débitos ≠ créditos", unbalancedEntries, unbalancedCurrencies)
 	}
 }
 

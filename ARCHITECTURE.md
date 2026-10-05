@@ -52,6 +52,7 @@ Para executar, veja o [README](README.md).
 | inbox, SQS, DLQ | [Inbox, SQS e DLQ](#inbox-sqs-e-dlq) |
 | outbox | [Outbox](#outbox-publicação-de-eventos) |
 | reconciliação | [Reconciliação](#reconciliação) |
+| partidas dobradas, balancete | [Partidas dobradas](#partidas-dobradas) |
 | logs, métricas, traces | [Observabilidade](#observabilidade-métricas-logs-e-traces) |
 | quedas e recuperação | [Caos, quedas e recuperação](#caos-quedas-e-recuperação) |
 | o que foi interpretado, o que falta | [Interpretações](#interpretações-adotadas), [Limitações](#limitações), [Trabalho não concluído](#trabalho-não-concluído) |
@@ -330,6 +331,11 @@ Valem mesmo que o código Go tenha um bug ou que alguém acesse o banco direto.
 | registros financeiros não são apagados | triggers em `wallets` e `wager_transactions` |
 | inbox deduplica | `PRIMARY KEY (consumer_name, message_id)` |
 | payload da outbox é snapshot | trigger `outbox_guard_update` (inclusive `seq`, migration 000002); `published_at` não volta a nulo |
+| **lançamento contábil fecha** | constraint trigger adiado `journal_check_entry`: ≥ 2 partidas, uma moeda, Σ débitos = Σ créditos ([partidas dobradas](#partidas-dobradas)) |
+| **ledger da carteira = razão** | `journal_check_entry` + `ledger_check_journal` (adiados): toda partida em conta de carteira tem o lançamento idêntico no ledger, e vice-versa |
+| contrapartida certa | `journal_check_entry`: conta do provedor DA transação; caixa só na abertura |
+| código da conta coerente com o tipo | `CHECK ledger_accounts_shape` (`wallet:<id>`, `cash:<moeda>`, `provider:<p>:<moeda>`) |
+| razão append-only | triggers contra `UPDATE`/`DELETE`/`TRUNCATE` em `journal_postings` e `ledger_accounts` |
 
 Com o encadeamento e a checagem adiada, o saldo armazenado é sempre igual ao
 último `balance_after` da cadeia de lançamentos, e a cadeia começa em zero.
@@ -1053,11 +1059,15 @@ Arquivos: [`app/reconcile.go`](internal/app/reconcile.go),
   "storedBalance": { "amount": "975.00", "currency": "BRL" },
   "calculatedBalance": { "amount": "975.00", "currency": "BRL" },
   "difference": { "amount": "0.00", "currency": "BRL" },
+  "journalBalance": { "amount": "975.00", "currency": "BRL" },
   "consistent": true,
   "checkedEntries": 2
 }
 ```
 
+- **Três fontes, um valor:** o saldo gravado, o reconstruído do ledger e o
+  da conta `wallet:<id>` no [razão em partidas dobradas](#partidas-dobradas)
+  (`journalBalance`). `consistent` exige os três iguais.
 - **Reconstrução:** `calculatedBalance = Σ créditos − Σ débitos` de **todos**
   os lançamentos da carteira, abertura incluída (`SUM` com `FILTER` por
   direção, num único `SELECT`). `difference = storedBalance − calculatedBalance`:
@@ -1090,6 +1100,185 @@ Experimento registrado: trocando `REPEATABLE READ` por `READ COMMITTED` na
 leitura, 91 de 1530 reconciliações sob carga acusaram divergência falsa
 (saldo 10000.00 × ledger 9999.00: uma aposta confirmou entre as duas
 leituras).
+
+## Partidas dobradas
+
+Arquivos: [`domain/accounting`](internal/domain/accounting/accounting.go),
+[`postgres/journal.go`](internal/adapters/postgres/journal.go),
+[`app/trial_balance.go`](internal/app/trial_balance.go),
+migrations [000005](migrations/000005_double_entry.up.sql) e
+[000006](migrations/000006_double_entry_enforce.up.sql).
+
+O ledger por carteira (obrigatório no enunciado) é o extrato do jogador:
+mostra quanto entrou e saiu da carteira, mas não **de onde veio nem para onde
+foi**. O razão em partidas dobradas registra os dois lados: cada movimentação
+é um lançamento contábil com pelo menos duas partidas, e Σ débitos =
+Σ créditos. Dinheiro não aparece nem some; muda de conta.
+
+### Plano de contas (ponto de vista da operadora)
+
+| Conta | Tipo | Cresce a | Significado |
+|---|---|---|---|
+| `wallet:<walletId>` | passivo | crédito | o que a casa deve ao jogador (= saldo da carteira) |
+| `cash:<moeda>` | ativo | débito | dinheiro que entrou na plataforma (saldo de abertura) |
+| `provider:<providerId>:<moeda>` | receita | crédito | apostas − prêmios com aquele provedor (GGR) |
+
+| Operação | Partidas |
+|---|---|
+| abertura 100,00 | D `cash:BRL` 100 / C `wallet:<id>` 100 |
+| `BET` 25,00 | D `wallet:<id>` 25 / C `provider:<p>:BRL` 25 |
+| `WIN` 40,00 | D `provider:<p>:BRL` 40 / C `wallet:<id>` 40 |
+| `REFUND`/`ROLLBACK` | o mesmo, no sentido do lançamento da carteira |
+| `LOSS` (0,00), operação recusada | nenhuma (não há movimentação) |
+
+A partida da conta da carteira **é** o lançamento do ledger (mesma
+transação, direção e valor): o ledger da carteira é a projeção do razão na
+conta dela. A contrapartida sai da natureza da operação
+(`accounting.ForTransaction`): caixa na abertura, a conta **do provedor da
+operação** no resto. Equação: ativo = passivo + receita, ou seja, o caixa que
+entrou é o que se deve aos jogadores mais o resultado com os provedores.
+
+### Onde mora cada regra
+
+| Regra | Domínio (`accounting`) | Banco (no `COMMIT`) |
+|---|---|---|
+| Σ débitos = Σ créditos, ≥ 2 partidas, uma moeda | `NewJournalEntry` | `journal_check_entry` |
+| uma partida por conta no lançamento | `NewJournalEntry` | `PRIMARY KEY (transaction_id, account_code)` |
+| partida da carteira = lançamento do ledger | `ForWalletMovement` | `journal_check_entry` + `ledger_check_journal` |
+| contrapartida certa (provedor da operação, caixa só na abertura) | `ForTransaction` | `journal_check_entry` |
+| código coerente com o tipo da conta | construtores de `Account` | `CHECK ledger_accounts_shape` |
+| moeda da partida = moeda da conta | `NewJournalEntry` | FK `(account_code, currency)` |
+| imutável | sem setters; `Postings()` devolve cópia | triggers contra `UPDATE`/`DELETE`/`TRUNCATE` |
+
+Como no resto do schema, o banco repete as regras: um bug no Go (ou alguém
+com o papel da aplicação) não confirma um lançamento torto. Mutações
+registradas: a aposta lançada contra o caixa e o caso de uso que "esquece"
+de gravar o razão são barrados pelo **banco** (`500` e nada confirmado), não
+só pelo Go.
+
+### Por que as contas da casa não guardam saldo
+
+Toda aposta mexe na conta do provedor. Com uma coluna de saldo nela, cada
+aposta de cada carteira atualizaria a **mesma linha**: um lock global, e as
+carteiras deixariam de andar em paralelo. Então nenhuma conta guarda saldo;
+o saldo é a soma das partidas (`journal_postings_account_idx`). A carteira
+continua com o saldo dela em `wallets` (lido a cada operação), e o razão
+confere esse número. As contas são criadas na primeira partida, com
+`ON CONFLICT DO NOTHING`, que não trava a linha existente.
+
+### Balancete (`GET /accounting/trial-balance?currency=BRL`, só `wallet-admin`)
+
+```json
+{
+  "currency": "BRL", "balanced": true,
+  "totalDebits":  { "amount": "320.00", "currency": "BRL" },
+  "totalCredits": { "amount": "320.00", "currency": "BRL" },
+  "accounts": [
+    { "account": "cash:BRL", "type": "ASSET", "accounts": 1,
+      "debits": {"amount": "200.00", ...}, "credits": {"amount": "0.00", ...}, "balance": {"amount": "200.00", ...} },
+    { "account": "provider:provider-a:BRL", "type": "REVENUE", "balance": {"amount": "-20.00", ...}, ... },
+    { "account": "wallet:*", "type": "LIABILITY", "accounts": 2, "balance": {"amount": "220.00", ...}, ... }
+  ],
+  "wallets": { "count": 2, "journalBalance": {"amount": "220.00", ...},
+               "storedBalance": {"amount": "220.00", ...}, "consistent": true }
+}
+```
+
+- As carteiras vêm numa linha só (`wallet:*`); as contas da casa, uma a uma.
+- `balance` fica no lado natural da conta. Receita negativa = o provedor
+  pagou mais prêmios do que recebeu de apostas.
+- `wallets.consistent`: o passivo com os jogadores no razão é igual à soma
+  dos saldos **gravados** nas carteiras.
+- Mesma foto do banco (`ReadSnapshot`), como a reconciliação: com tráfego no
+  meio, os números fecham. Divergência é resultado (`200`, `balanced` ou
+  `consistent` falsos, log `ERROR`). Custo: varre as partidas da moeda
+  (1,4 s com 1,26 milhão de partidas, no banco do teste de carga); é
+  consulta de auditoria, não de caminho quente. Em produção, viraria um
+  fechamento periódico (saldo por conta até uma data, gravado) para não
+  varrer o histórico inteiro.
+
+### Migration em duas etapas (expandir / contrair)
+
+O primeiro rascunho era uma migration só: criar as tabelas, preencher o
+histórico e ligar a regra "todo lançamento do ledger tem partida". Sobre o
+banco do teste de carga (385 mil lançamentos) ela rodou **5 minutos** sem
+terminar (cancelada): o gatilho adiado conferia, no `COMMIT`, cada uma das
+770 mil partidas, uma consulta por vez. E havia um problema pior: uma
+instância ainda na versão antiga (que não grava o razão) passaria a falhar
+em toda aposta assim que a regra existisse.
+
+| Etapa | O que faz | Instâncias antigas no ar? |
+|---|---|---|
+| `000005` expandir | cria contas, partidas e a regra "lançamento fecha" (vale para partidas novas) | ✅ não tocam nas tabelas novas |
+| deploy | todas as instâncias passam a gravar ledger e razão juntos | — |
+| `000006` contrair | pausa as escritas de dinheiro, preenche o histórico **em lote**, confere em lote (4 consultas), cria as FKs, liga "todo lançamento do ledger tem partida", `ANALYZE` | ❌ precisam já estar atualizadas |
+
+```sh
+go run ./cmd/migrate to 5   # expandir
+# ... deploy da aplicação em todas as instâncias ...
+go run ./cmd/migrate up     # contrair
+```
+
+(No compose, `migrate up` aplica as duas antes de a API subir: não há
+instância antiga.)
+
+Medições no banco do teste de carga, que tem 385 mil lançamentos:
+
+| Versão | Tempo |
+|---|---|
+| migration única, gatilho conferindo cada partida no `COMMIT` | > 5 min (cancelada) |
+| 000006 com preenchimento e conferência em lote, mas FKs já existentes: cada linha checada, travando a linha referenciada (`FOR KEY SHARE`), ~18 s por FK | 57 s |
+| 000006 em lote, **FKs criadas depois do preenchimento** (uma consulta de validação cada) | **16 s** |
+
+- A pausa: `LOCK TABLE wallets IN EXCLUSIVE MODE` bloqueia quem trava
+  carteira (toda escrita de dinheiro), não quem lê. Escritas esperam; as que
+  passarem do `HTTP_REQUEST_TIMEOUT` recebem `503` e podem ser repetidas
+  (idempotência). A ordem dos locks evita deadlock: quem já tem carteira
+  travada termina antes; o preenchimento (FK de `ledger_accounts` para
+  `wallets`) não espera por ninguém.
+- Até a 000006, sem as FKs, `journal_check_entry` exige transação e conta
+  existentes (`foreign_key_violation`).
+- O `ANALYZE` no fim não é detalhe: sem ele, a carga logo depois da
+  migration rodou a **274 req/s**; com estatísticas, a **463 req/s**. As
+  consultas do gatilho rodam no `COMMIT`, com a carteira travada; um plano
+  ruim ali vira fila em todas as carteiras.
+- Para um histórico muito maior: preencher antes, em lotes, com a aplicação
+  no ar (os lançamentos sem partida são só os antigos, um conjunto que não
+  cresce mais) e deixar a 000006 só conferir e ligar a regra.
+
+### Custo (A/B no mesmo banco e máquina; ver [LOAD-TEST.md](docs/LOAD-TEST.md#custo-das-partidas-dobradas))
+
+| | Sem partidas dobradas | Com | |
+|---|---|---|---|
+| capacidade | 590 req/s | 463 req/s | −21% |
+| 300 req/s: p50 / p95 / p99 | 8.4 / 16.5 / 24.1 ms | 13.4 / 30.5 / 46.0 ms | +5 / +14 / +22 ms |
+| erros, conflitos, reconciliação | 0, 0, 200/200 | 0, 0, 200/200 | |
+
+Decomposição (gatilhos desligados só no experimento): ~15 pontos são as
+escritas a mais (2 partidas, 4 entradas de índice e 1 comando por
+movimentação) e ~6 são as conferências no `COMMIT`. Duas tentativas de
+reduzir, registradas:
+
+- **Conferir o lançamento uma vez só** (o gatilho dispara por partida):
+  abria um desvio. Uma partida acrescentada depois, noutra transação, a um
+  lançamento já confirmado, passaria sem conferência
+  (`TestJournal_CannotAppendToCommittedEntry` pega). Ficou: cada disparo
+  confere tudo, mas numa consulta só (eram 5).
+- **Índice parcial só para contas de carteira** (hipótese: as poucas contas
+  de provedor concentram as inserções nas mesmas páginas do índice): 447
+  contra 463 req/s, dentro do ruído. Hipótese descartada.
+
+### Testes
+
+| Teste | Comprova |
+|---|---|
+| `accounting_test.go` | contas e lados naturais; `NewJournalEntry` recusa desbalanceado, partida única, conta repetida, valor zero, direção inválida, moedas misturadas; `ForWalletMovement` espelha o ledger; `ForTransaction` escolhe caixa ou o provedor da operação; imutável |
+| `TestJournal_Invariants` | o banco recusa: débitos ≠ créditos, partida sozinha, ledger sem partida, partida sem ledger ou divergente, contrapartida de outro provedor, caixa numa aposta, conta inexistente, moeda trocada |
+| `TestJournal_CannotAppendToCommittedEntry` | uma partida acrescentada depois a um lançamento confirmado é recusada |
+| `TestJournal_AccountsAreConsistentAndImmutable` | código incoerente com o tipo; `UPDATE`/`DELETE`/`TRUNCATE` recusados (aplicação e dono) |
+| `TestMigrations_DoubleEntryBackfill` | dados da versão antiga (só ledger) ganham partidas na 000006; o razão fecha com os saldos esperados; depois, lançamento sem partida não confirma |
+| `TestAccounting_TrialBalance` | pela API: abertura, aposta, prêmio, perda, devolução e recusada → balancete com os números da tabela acima; reconciliação com `journalBalance`; `400`/`403` |
+| `apptest.AssertReconciled` | agora confere também o razão (por carteira e global); como é chamado no fim dos testes de concorrência, caos, `kill -9` e multi-instância, o razão é conferido em todos esses cenários |
 
 ---
 
@@ -1418,6 +1607,4 @@ Itens fora do escopo entregue, em ordem de prioridade para produção:
 3. **Alertas** sobre as métricas existentes (`outbox_lag_seconds`,
    `sqs_queue_messages{queue="dlq"}`, `reconciliation_mismatch_total`,
    `wallet_lock_conflicts_total`) e ferramenta para reprocessar a DLQ.
-4. **Partidas dobradas** (diferencial opcional): hoje o ledger é de entrada
-   simples por carteira.
-5. **Rate limiting** por provedor e Keycloak em modo de produção.
+4. **Rate limiting** por provedor e Keycloak em modo de produção.

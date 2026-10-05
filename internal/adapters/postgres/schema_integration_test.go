@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,39 @@ func insertLedger(c context.Context, q pgx.Tx, r ledgerRow) error {
 	return err
 }
 
+// insertPostings grava as partidas dobradas de uma movimentação de
+// carteira, como a aplicação: a conta da carteira repete o lançamento do
+// ledger e a contrapartida (caixa ou provedor) fica do lado oposto. As
+// contas são criadas na primeira vez.
+func insertPostings(c context.Context, q pgx.Tx, txID, walletID uuid.UUID, direction string, amount int64, counterpart string) error {
+	opposite := map[string]string{"DEBIT": "CREDIT", "CREDIT": "DEBIT"}[direction]
+	walletCode := "wallet:" + walletID.String()
+	if _, err := q.Exec(c, `INSERT INTO ledger_accounts (code, type, currency, wallet_id, created_at)
+		VALUES ($1, 'LIABILITY', 'BRL', $2, $3) ON CONFLICT DO NOTHING`, walletCode, walletID, t0); err != nil {
+		return err
+	}
+	if err := ensureHouseAccount(c, q, counterpart); err != nil {
+		return err
+	}
+	_, err := q.Exec(c, `INSERT INTO journal_postings (transaction_id, account_code, direction, amount_minor, currency, created_at)
+		VALUES ($1, $2, $3, $5, 'BRL', $6), ($1, $4, $7, $5, 'BRL', $6)`,
+		txID, walletCode, direction, counterpart, amount, t0, opposite)
+	return err
+}
+
+// ensureHouseAccount cria cash:BRL ou provider:<p>:BRL.
+func ensureHouseAccount(c context.Context, q pgx.Tx, code string) error {
+	if code == "cash:BRL" {
+		_, err := q.Exec(c, `INSERT INTO ledger_accounts (code, type, currency, created_at)
+			VALUES ('cash:BRL', 'ASSET', 'BRL', $1) ON CONFLICT DO NOTHING`, t0)
+		return err
+	}
+	provider := strings.TrimSuffix(strings.TrimPrefix(code, "provider:"), ":BRL")
+	_, err := q.Exec(c, `INSERT INTO ledger_accounts (code, type, currency, provider_id, created_at)
+		VALUES ($1, 'REVENUE', 'BRL', $2, $3) ON CONFLICT DO NOTHING`, code, provider, t0)
+	return err
+}
+
 type wallet struct{ ID, PlayerID uuid.UUID }
 
 // openWallet abre uma carteira como a aplicação fará: carteira + OPENING +
@@ -171,8 +205,11 @@ func openWallet(t *testing.T, p *pgxpool.Pool, balance int64) wallet {
 		if err := insertWager(c, tx, opening); err != nil {
 			return err
 		}
-		return insertLedger(c, tx, ledgerRow{WalletID: w.ID, TxID: opening.ID, Version: 1,
-			Direction: "CREDIT", Amount: balance, Before: 0, After: balance})
+		if err := insertLedger(c, tx, ledgerRow{WalletID: w.ID, TxID: opening.ID, Version: 1,
+			Direction: "CREDIT", Amount: balance, Before: 0, After: balance}); err != nil {
+			return err
+		}
+		return insertPostings(c, tx, opening.ID, w.ID, "CREDIT", balance, "cash:BRL")
 	})
 	if err != nil {
 		t.Fatalf("openWallet: %v", err)
@@ -197,6 +234,9 @@ func debit(t *testing.T, p *pgxpool.Pool, w wallet, extID string, amount int64) 
 		}
 		if err := insertLedger(c, tx, ledgerRow{WalletID: w.ID, TxID: row.ID, Version: version + 1,
 			Direction: "DEBIT", Amount: amount, Before: balance, After: balance - amount}); err != nil {
+			return err
+		}
+		if err := insertPostings(c, tx, row.ID, w.ID, "DEBIT", amount, "provider:provider-a:BRL"); err != nil {
 			return err
 		}
 		_, err := tx.Exec(c, `UPDATE wallets SET balance_minor = $2, version = version + 1, updated_at = $3 WHERE id = $1`,

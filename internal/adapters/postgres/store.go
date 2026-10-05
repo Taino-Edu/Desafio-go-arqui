@@ -83,5 +83,6 @@ type repositories struct{ q querier }
 func (r repositories) Wallets() app.WalletRepository           { return walletRepo(r) }
 func (r repositories) Transactions() app.TransactionRepository { return transactionRepo(r) }
 func (r repositories) Ledger() app.LedgerRepository            { return ledgerRepo(r) }
+func (r repositories) Journal() app.JournalRepository          { return journalRepo(r) }
 func (r repositories) Outbox() app.OutboxRepository            { return outboxRepo(r) }
 func (r repositories) Inbox() app.InboxRepository              { return inboxRepo(r) }

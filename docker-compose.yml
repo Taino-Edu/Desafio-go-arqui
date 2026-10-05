@@ -139,7 +139,7 @@ services:
       OUTBOX_QUEUE: wallet-events.fifo
       # traces -> Jaeger. Sem coletor no ar a API segue normalmente (os
       # spans são descartados depois de tentar exportar).
-      TRACING_ENABLED: "true"
+      TRACING_ENABLED: ${TRACING_ENABLED:-true}
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports:
       - "${APP_PORT:-8080}:8080"

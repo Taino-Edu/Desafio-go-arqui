@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/accounting"
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/money"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wallet"
 )
@@ -34,6 +36,7 @@ type Repositories interface {
 	Wallets() WalletRepository
 	Transactions() TransactionRepository
 	Ledger() LedgerRepository
+	Journal() JournalRepository
 	Outbox() OutboxRepository
 	Inbox() InboxRepository
 }
@@ -99,6 +102,39 @@ type LedgerTotals struct {
 	Debits  int64 // Σ débitos
 	Entries int64 // quantidade de lançamentos
 }
+
+// JournalRepository grava e lê o razão em partidas dobradas.
+type JournalRepository interface {
+	// Post grava as partidas do lançamento, criando as contas que ainda não
+	// existem (primeira movimentação de cada carteira, provedor e moeda).
+	Post(ctx context.Context, j accounting.JournalEntry) error
+	// AccountTotals soma as partidas de uma conta.
+	AccountTotals(ctx context.Context, code string) (LedgerTotals, error)
+	// TrialBalance soma o razão de uma moeda: cada conta da casa numa linha
+	// e todas as carteiras numa linha só; e soma o saldo GRAVADO das
+	// carteiras dessa moeda, para conferir os dois.
+	TrialBalance(ctx context.Context, currency money.Currency) (TrialBalanceData, error)
+}
+
+// TrialBalanceData são as somas brutas do balancete, em unidades mínimas.
+type TrialBalanceData struct {
+	Rows                 []TrialBalanceRow
+	StoredWalletBalances int64 // Σ wallets.balance_minor
+	Wallets              int64 // carteiras na moeda
+}
+
+// TrialBalanceRow soma as partidas de uma conta da casa ou, com Account =
+// WalletAccountsRow, de todas as contas de carteira.
+type TrialBalanceRow struct {
+	Account  string
+	Type     accounting.AccountType
+	Accounts int64 // contas somadas na linha
+	Debits   int64
+	Credits  int64
+}
+
+// WalletAccountsRow é a linha que agrupa as contas de carteira.
+const WalletAccountsRow = "wallet:*"
 
 // InboxEntry é o registro de uma mensagem recebida por um consumidor.
 type InboxEntry struct {

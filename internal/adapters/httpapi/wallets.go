@@ -188,6 +188,7 @@ type reconciliationResponse struct {
 	StoredBalance     MoneyDTO `json:"storedBalance"`
 	CalculatedBalance MoneyDTO `json:"calculatedBalance"`
 	Difference        MoneyDTO `json:"difference"`
+	JournalBalance    MoneyDTO `json:"journalBalance"`
 	Consistent        bool     `json:"consistent"`
 	CheckedEntries    int64    `json:"checkedEntries"`
 }
@@ -224,6 +225,7 @@ func (h walletHandlers) reconcile(w http.ResponseWriter, r *http.Request) {
 		StoredBalance:     toMoneyDTO(rec.StoredBalance),
 		CalculatedBalance: toMoneyDTO(rec.CalculatedBalance),
 		Difference:        toMoneyDTO(rec.Difference),
+		JournalBalance:    toMoneyDTO(rec.JournalBalance),
 		Consistent:        rec.Consistent,
 		CheckedEntries:    rec.CheckedEntries,
 	})

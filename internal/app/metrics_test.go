@@ -111,18 +111,25 @@ func TestCompare(t *testing.T) {
 	// o exemplo do enunciado: abertura 1000.00 e aposta 25.00
 	totals := LedgerTotals{Credits: 100000, Debits: 2500, Entries: 2}
 
+	// o razão em partidas dobradas, na conta da carteira, vale o mesmo
+	journal := totals
+	journalOff := LedgerTotals{Credits: 100000, Debits: 1500, Entries: 2}
+
 	tests := map[string]struct {
 		stored         money.Money
+		journal        LedgerTotals
 		wantDiff       string
 		wantConsistent bool
 	}{
-		"bate com o ledger":          {brl("975.00"), "0.00", true},
-		"saldo a mais que o ledger":  {brl("985.00"), "10.00", false},
-		"saldo a menos que o ledger": {brl("965.00"), "-10.00", false},
+		"bate com o ledger":          {brl("975.00"), journal, "0.00", true},
+		"saldo a mais que o ledger":  {brl("985.00"), journal, "10.00", false},
+		"saldo a menos que o ledger": {brl("965.00"), journal, "-10.00", false},
+		// saldo e ledger batem, mas o razão diverge: também é inconsistência
+		"razão diverge do ledger": {brl("975.00"), journalOff, "0.00", false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			rec, err := compare(walletWith(tt.stored), totals)
+			rec, err := compare(walletWith(tt.stored), totals, tt.journal)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -144,7 +151,7 @@ func TestCompare_OverflowIsAnErrorNotAWrongNumber(t *testing.T) {
 	}
 	// ledger absurdo: reconstruído = −MaxInt64; armazenado − reconstruído
 	// = 1 + MaxInt64, que não cabe em int64
-	_, err = compare(w, LedgerTotals{Credits: 0, Debits: math.MaxInt64})
+	_, err = compare(w, LedgerTotals{Credits: 0, Debits: math.MaxInt64}, LedgerTotals{})
 	if !errors.Is(err, money.ErrOverflow) {
 		t.Errorf("err = %v, want ErrOverflow", err)
 	}

@@ -65,6 +65,9 @@ vazão.
 
 ## Resultados
 
+Medidos antes do razão em partidas dobradas; o custo dele está em [Custo das
+partidas dobradas](#custo-das-partidas-dobradas).
+
 | Cenário | Vazão | p50 / p95 / p99 | Erros | Conflitos de lock | Atraso da outbox médio / máx. | Outbox vazia após | Reconciliação |
 |---|---|---|---|---|---|---|---|
 | Capacidade, 1 instância | **648 req/s** | 38.6 / 108.4 / 265.1 ms | 0 | 0 | 26.0 s / 52.1 s | 49 s | 200/200 ✅ |
@@ -139,6 +142,34 @@ Antes × depois, mesma carga de capacidade (32 clientes, 1 instância):
 Cada mudança foi verificada com mutação: com os eventos de um agregado
 publicados em paralelo, ou tudo numa onda só, os testes de ordem falham
 (`[1 3 2 4 ...]`); com a consulta antiga, o teste de regressão falha.
+
+## Custo das partidas dobradas
+
+A tabela de Resultados acima é de antes do [razão em partidas
+dobradas](../ARCHITECTURE.md#partidas-dobradas). Para medir o custo dele,
+um A/B no **mesmo banco e na mesma máquina**: as duas versões rodando como
+binário local (`:9091`, tracing desligado), trocando só a versão da
+aplicação e do schema (`migrate to 4` / `up`) entre as rodadas.
+
+| Rodada | Vazão | p50 / p95 / p99 | Erros | Reconciliação | Relatório |
+|---|---|---|---|---|---|
+| A: sem partidas dobradas, capacidade | **590 req/s** | 44.2 / 110.4 / 263.6 ms | 0 | 200/200 ✅ | [A-capacidade](load/partidas-dobradas-A-capacidade.md) |
+| B: com, capacidade | **463 req/s** (−21%) | 53.6 / 158.1 / 423.0 ms | 0 | 200/200 ✅ | [B-capacidade](load/partidas-dobradas-B-capacidade.md) |
+| A: sem, 300 req/s | 300 req/s | **8.4 / 16.5 / 24.1 ms** | 0 | 200/200 ✅ | [A-300](load/partidas-dobradas-A-300.md) |
+| B: com, 300 req/s | 300 req/s | **13.4 / 30.5 / 46.0 ms** | 0 | 200/200 ✅ | [B-300](load/partidas-dobradas-B-300.md) |
+
+De onde vem a diferença na capacidade (rodadas extras, mesmo banco):
+
+| Rodada | Vazão | Leitura |
+|---|---|---|
+| B logo depois da migration 000006, **sem estatísticas** | 274 req/s | o autovacuum ainda não tinha analisado as 770 mil partidas recém-inseridas; as consultas do gatilho (no `COMMIT`, com a carteira travada) usaram planos ruins. **Corrigido:** `ANALYZE` no fim da 000006 |
+| B com os gatilhos do razão desligados (só no experimento) | 501 req/s | as escritas a mais custam ~15%: 2 partidas, 4 entradas de índice e 1 comando por movimentação |
+| B com índice parcial só para contas de carteira | 447 req/s | hipótese de disputa nas páginas do índice das poucas contas de provedor: **descartada** (dentro do ruído de ~4% entre duas rodadas iguais) |
+
+Resumo: a 300 req/s o razão custa ~5 ms na mediana e ~22 ms no p99, sem
+erro; o teto cai ~21%, quase tudo pelo volume de escrita, que é o preço de
+registrar o dinheiro dos dois lados. Nenhuma conta da casa guarda saldo,
+então as carteiras continuam sem disputa entre si (conflitos de lock: 0).
 
 ## Limitações do teste
 

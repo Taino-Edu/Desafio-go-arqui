@@ -124,9 +124,17 @@ expect 200; show '{balance, version}'
 call GET "/wallets/$WALLET/ledger" "$ADMIN"
 jq -r '.items[] | "\(.walletVersion)  \(.direction)\t\(.money.amount)\t\(.balanceBefore.amount) -> \(.balanceAfter.amount)"' <<<"$BODY"
 
-step "reconciliação: saldo armazenado x ledger"
+step "reconciliação: saldo armazenado x ledger x razão em partidas dobradas"
 call POST "/wallets/$WALLET/reconciliation" "$ADMIN"
 expect 200; show .
+[[ $(jq -r .consistent <<<"$BODY") == "true" ]] || fail "reconciliação divergente"
+
+step "balancete (partidas dobradas): Σ débitos = Σ créditos"
+call GET "/accounting/trial-balance?currency=BRL" "$ADMIN"
+expect 200
+jq -r '.accounts[] | "\(.type)\t\(.account)\tD \(.debits.amount)\tC \(.credits.amount)\tsaldo \(.balance.amount)"' <<<"$BODY"
+show '{balanced, totalDebits: .totalDebits.amount, totalCredits: .totalCredits.amount, wallets: .wallets.consistent}'
+[[ $(jq -r '.balanced and .wallets.consistent' <<<"$BODY") == "true" ]] || fail "balancete não fecha"
 
 step "métricas (público)"
 curl -sf "$API/metrics" | grep -E '^(wager_transactions_total|idempotent_replays_total|idempotency_conflicts_total|sqs_messages_total|outbox_lag_seconds|reconciliations_total)' | head -12

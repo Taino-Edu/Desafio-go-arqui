@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/accounting"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/money"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wallet"
 )
@@ -17,12 +18,16 @@ type Reconciliation struct {
 	StoredBalance     money.Money // saldo gravado na carteira
 	CalculatedBalance money.Money // Σ créditos − Σ débitos do ledger
 	Difference        money.Money // armazenado − reconstruído (pode ser negativo)
-	Consistent        bool
-	CheckedEntries    int64
+	// JournalBalance é o saldo da conta wallet:<id> no razão em partidas
+	// dobradas (créditos − débitos). Tem de ser igual ao reconstruído.
+	JournalBalance money.Money
+	Consistent     bool
+	CheckedEntries int64
 }
 
 // Reconcile reconstrói o saldo a partir do ledger, abertura incluída
-// (Σ créditos − Σ débitos), e compara com o saldo armazenado.
+// (Σ créditos − Σ débitos), e compara com o saldo armazenado e com o saldo
+// da conta da carteira no razão em partidas dobradas: três fontes, um valor.
 //
 // As duas leituras acontecem na MESMA foto do banco (ReadSnapshot): uma
 // aposta confirmada durante a conferência não aparece numa leitura e falta
@@ -33,22 +38,30 @@ type Reconciliation struct {
 // (o ledger nunca é editado).
 func (s *WalletService) Reconcile(ctx context.Context, walletID uuid.UUID) (Reconciliation, error) {
 	var (
-		w      *wallet.Wallet
-		totals LedgerTotals
+		w       *wallet.Wallet
+		totals  LedgerTotals
+		journal LedgerTotals
 	)
 	err := s.store.ReadSnapshot(ctx, func(ctx context.Context, r Repositories) error {
 		var err error
 		if w, err = r.Wallets().Get(ctx, walletID); err != nil {
 			return err
 		}
-		totals, err = r.Ledger().Totals(ctx, walletID)
+		if totals, err = r.Ledger().Totals(ctx, walletID); err != nil {
+			return err
+		}
+		acc, err := accounting.WalletAccount(walletID, w.Currency())
+		if err != nil {
+			return err
+		}
+		journal, err = r.Journal().AccountTotals(ctx, acc.Code())
 		return err
 	})
 	if err != nil {
 		return Reconciliation{}, err
 	}
 
-	rec, err := compare(w, totals)
+	rec, err := compare(w, totals, journal)
 	if err != nil {
 		return Reconciliation{}, fmt.Errorf("reconcile wallet %s: %w", walletID, err)
 	}
@@ -58,17 +71,13 @@ func (s *WalletService) Reconcile(ctx context.Context, walletID uuid.UUID) (Reco
 
 // compare faz a aritmética da reconciliação com Money: overflow e moeda
 // incompatível viram erro, nunca um número errado.
-func compare(w *wallet.Wallet, t LedgerTotals) (Reconciliation, error) {
+func compare(w *wallet.Wallet, t, journal LedgerTotals) (Reconciliation, error) {
 	cur := w.Currency()
-	credits, err := money.FromMinorUnits(t.Credits, cur)
+	calculated, err := net(t.Credits, t.Debits, cur)
 	if err != nil {
 		return Reconciliation{}, err
 	}
-	debits, err := money.FromMinorUnits(t.Debits, cur)
-	if err != nil {
-		return Reconciliation{}, err
-	}
-	calculated, err := credits.Sub(debits)
+	journalBalance, err := net(journal.Credits, journal.Debits, cur)
 	if err != nil {
 		return Reconciliation{}, err
 	}
@@ -78,8 +87,23 @@ func compare(w *wallet.Wallet, t LedgerTotals) (Reconciliation, error) {
 	}
 	return Reconciliation{
 		WalletID: w.ID(), StoredBalance: w.Balance(), CalculatedBalance: calculated,
-		Difference: diff, Consistent: diff.IsZero(), CheckedEntries: t.Entries,
+		Difference: diff, JournalBalance: journalBalance,
+		Consistent:     diff.IsZero() && journalBalance.Equal(calculated),
+		CheckedEntries: t.Entries,
 	}, nil
+}
+
+// net devolve plus − minus em Money (overflow vira erro).
+func net(plus, minus int64, cur money.Currency) (money.Money, error) {
+	p, err := money.FromMinorUnits(plus, cur)
+	if err != nil {
+		return money.Money{}, err
+	}
+	m, err := money.FromMinorUnits(minus, cur)
+	if err != nil {
+		return money.Money{}, err
+	}
+	return p.Sub(m)
 }
 
 // Backlog é o trabalho assíncrono acumulado, lido para as métricas.

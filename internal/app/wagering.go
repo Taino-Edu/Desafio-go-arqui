@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/accounting"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/domainerr"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/money"
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/domain/wagering"
@@ -267,7 +268,8 @@ func (s *WagerService) evaluate(ctx context.Context, r Repositories, tx *wagerin
 }
 
 // persist grava, na transação SQL corrente, o novo estado da operação, o
-// saldo e o lançamento (se houve movimentação) e os eventos na outbox.
+// saldo, o lançamento e as partidas dobradas (se houve movimentação) e os
+// eventos na outbox.
 func (s *WagerService) persist(ctx context.Context, r Repositories, tx *wagering.WagerTransaction,
 	w *wallet.Wallet, entry *wallet.LedgerEntry) error {
 
@@ -284,7 +286,14 @@ func (s *WagerService) persist(ctx context.Context, r Repositories, tx *wagering
 		}
 	}
 	if entry != nil {
+		journal, err := accounting.ForTransaction(tx, *entry)
+		if err != nil {
+			return err
+		}
 		if err := r.Ledger().Insert(ctx, *entry); err != nil {
+			return err
+		}
+		if err := r.Journal().Post(ctx, journal); err != nil {
 			return err
 		}
 	}
