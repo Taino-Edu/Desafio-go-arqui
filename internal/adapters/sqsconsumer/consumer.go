@@ -27,6 +27,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
 )
@@ -57,6 +61,10 @@ type Config struct {
 	RetryMaxDelay    time.Duration
 	AllowedProviders map[string]bool // vazio = qualquer provedor
 	Metrics          Metrics         // nil = sem métricas
+	// Tracer e Propagator: um span por mensagem, continuando o trace do
+	// produtor quando a mensagem traz traceparent (nil = sem tracing).
+	Tracer     trace.Tracer
+	Propagator propagation.TextMapPropagator
 }
 
 // Metrics recebe o desfecho de cada mensagem recebida.
@@ -116,6 +124,12 @@ func New(cfg Config, api API, handler Handler, log *slog.Logger, hooks Hooks) *C
 	}
 	if cfg.Metrics == nil {
 		cfg.Metrics = nopMetrics{}
+	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = noop.NewTracerProvider().Tracer("")
+	}
+	if cfg.Propagator == nil {
+		cfg.Propagator = propagation.TraceContext{}
 	}
 	return &Consumer{cfg: cfg, api: api, handler: handler, hooks: hooks,
 		log: log.With("component", "sqs-consumer", "queue", cfg.QueueURL), stop: make(chan struct{})}
@@ -184,6 +198,7 @@ func (c *Consumer) poll(pollCtx, workCtx context.Context) {
 				types.MessageSystemAttributeNameApproximateReceiveCount,
 				types.MessageSystemAttributeNameMessageGroupId,
 			},
+			MessageAttributeNames: traceAttributes,
 		})
 		if err != nil {
 			if c.stopping() {
@@ -215,6 +230,15 @@ func (c *Consumer) handle(workCtx context.Context, m types.Message) {
 	ctx, cancel := context.WithTimeout(workCtx, c.cfg.ItemTimeout)
 	defer cancel()
 	sqsID := aws.ToString(m.MessageId)
+	ctx = c.cfg.Propagator.Extract(ctx, attrCarrier(m.MessageAttributes))
+	ctx, span := c.cfg.Tracer.Start(ctx, "process "+MessageType,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "aws_sqs"),
+			attribute.String("messaging.message.id", sqsID),
+			attribute.String("messaging.destination.name", c.cfg.QueueURL),
+		))
+	defer span.End()
 	log := c.log.With("sqsMessageId", sqsID, "receiveCount", receiveCount(m))
 
 	qm, err := decode(aws.ToString(m.Body), c.cfg.ConsumerName)

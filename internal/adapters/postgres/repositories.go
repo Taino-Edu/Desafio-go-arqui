@@ -222,16 +222,18 @@ func (r ledgerRepo) Totals(ctx context.Context, walletID uuid.UUID) (app.LedgerT
 type outboxRepo struct{ q querier }
 
 // Append grava os eventos já serializados. next_attempt_at = occurred_at:
-// ficam disponíveis para o publisher assim que a transação confirmar.
+// ficam disponíveis para o publisher assim que a transação confirmar. O
+// traceparent do contexto vai junto, para a publicação continuar o trace.
 func (r outboxRepo) Append(ctx context.Context, records ...app.OutboxRecord) error {
+	parent := traceParent(ctx)
 	for _, rec := range records {
 		_, err := r.q.Exec(ctx, `
 			INSERT INTO outbox_events (
 				event_id, aggregate_type, aggregate_id, event_type, event_version,
-				correlation_id, causation_id, payload, occurred_at, next_attempt_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)`,
+				correlation_id, causation_id, payload, occurred_at, next_attempt_at, trace_parent)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10)`,
 			rec.EventID, rec.AggregateType, rec.AggregateID, rec.EventType, rec.EventVersion,
-			rec.CorrelationID, rec.CausationID, rec.Payload, rec.OccurredAt)
+			rec.CorrelationID, rec.CausationID, rec.Payload, rec.OccurredAt, parent)
 		if err != nil {
 			return classify(err)
 		}

@@ -154,6 +154,9 @@ type OutboxMessage struct {
 	Payload       []byte
 	OccurredAt    time.Time
 	Attempts      int // já contando esta tentativa
+	// TraceParent é o contexto de trace (W3C) de quem gravou o evento, opaco
+	// para a aplicação: o publicador continua esse trace ("" = sem trace).
+	TraceParent string
 }
 
 // EventPublisher entrega um evento ao destino externo (SQS).

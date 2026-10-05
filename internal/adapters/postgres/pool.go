@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,6 +20,8 @@ type PoolConfig struct {
 	StatementTimeout time.Duration
 	LockTimeout      time.Duration
 	ApplicationName  string
+	// Tracer recebe um span por comando SQL (nil = sem tracing).
+	Tracer pgx.QueryTracer
 }
 
 // NewPool cria o pool. Não abre conexão: as conexões são abertas sob
@@ -42,6 +45,9 @@ func NewPool(cfg PoolConfig) (*pgxpool.Pool, error) {
 		rp["application_name"] = cfg.ApplicationName
 	}
 	rp["timezone"] = "UTC"
+	if cfg.Tracer != nil {
+		pc.ConnConfig.Tracer = cfg.Tracer
+	}
 
 	pool, err := pgxpool.NewWithConfig(context.Background(), pc)
 	if err != nil {

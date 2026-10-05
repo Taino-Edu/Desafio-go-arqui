@@ -86,7 +86,7 @@ func (r outboxRepo) Claim(ctx context.Context, owner string, now time.Time, leas
 		  FROM claim
 		 WHERE o.event_id = claim.event_id
 		RETURNING o.event_id, o.aggregate_type, o.aggregate_id, o.event_type, o.event_version,
-		          o.correlation_id, o.payload, o.occurred_at, o.attempts, o.seq`,
+		          o.correlation_id, o.payload, o.occurred_at, o.attempts, o.seq, o.trace_parent`,
 		now, lease.Milliseconds(), owner, heads, perAggregate, window)
 	if err != nil {
 		return nil, classify(err)
@@ -100,10 +100,14 @@ func (r outboxRepo) Claim(ctx context.Context, owner string, now time.Time, leas
 	var claimed []withSeq
 	for rows.Next() {
 		var w withSeq
+		var parent *string
 		m := &w.msg
 		if err := rows.Scan(&m.EventID, &m.AggregateType, &m.AggregateID, &m.EventType, &m.EventVersion,
-			&m.CorrelationID, &m.Payload, &m.OccurredAt, &m.Attempts, &w.seq); err != nil {
+			&m.CorrelationID, &m.Payload, &m.OccurredAt, &m.Attempts, &w.seq, &parent); err != nil {
 			return nil, classify(err)
+		}
+		if parent != nil {
+			m.TraceParent = *parent
 		}
 		claimed = append(claimed, w)
 	}

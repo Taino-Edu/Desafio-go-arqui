@@ -51,14 +51,16 @@ func NewHandler(log *slog.Logger, cfg Config, wallets *app.WalletService, wagers
 
 	// Middlewares, de dentro para fora. A ordem importa: withRecover fica
 	// dentro de withMetrics para que um panic seja medido como 500;
-	// withMetrics fica colado no mux para ler r.Pattern; withCorrelation é o
-	// primeiro a rodar, então tudo abaixo já tem o correlationId.
+	// withMetrics fica colado no mux para ler r.Pattern (e dá ao span o nome
+	// da rota); withTracing é o primeiro a rodar e withCorrelation o
+	// segundo, então tudo abaixo já tem o span e o correlationId.
 	var h http.Handler = mux
 	h = withRecover(log, h)
 	h = withMetrics(obs.Requests, h)
 	h = withTimeout(cfg.RequestTimeout, h)
 	h = withLogging(log, h)
 	h = withCorrelation(h)
+	h = withTracing(obs.Tracer, obs.Propagator, h)
 	return h
 }
 

@@ -23,6 +23,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 
@@ -48,6 +51,7 @@ func New(cfg config.Config, extra ...fx.Option) fx.Option {
 		fx.WithLogger(func(l *slog.Logger) fxevent.Logger {
 			return &fxevent.SlogLogger{Logger: l.With("component", "fx")}
 		}),
+		TracingModule,
 		ObservabilityModule,
 		PostgresModule,
 		AppModule,
@@ -83,8 +87,8 @@ var ObservabilityModule = fx.Module("observability",
 		observability.NewPrometheus,
 		func(p *observability.Prometheus) app.Metrics { return p },
 		func(p *observability.Prometheus) sqsconsumer.Metrics { return p },
-		func(p *observability.Prometheus, log *slog.Logger) httpapi.Observability {
-			return httpapi.Observability{Requests: p, MetricsHandler: p.Handler(log)}
+		func(p *observability.Prometheus, log *slog.Logger, tr trace.Tracer, prop propagation.TextMapPropagator) httpapi.Observability {
+			return httpapi.Observability{Requests: p, MetricsHandler: p.Handler(log), Tracer: tr, Propagator: prop}
 		},
 	),
 	// atraso da outbox e pendências: lidos do banco a cada coleta
@@ -95,6 +99,49 @@ var ObservabilityModule = fx.Module("observability",
 	}),
 )
 
+// TracingModule: OpenTelemetry. Com TRACING_ENABLED=false (padrão) o
+// provider é noop: os spans não custam quase nada e nada sai do processo.
+// Ligado, exporta via OTLP/HTTP para o endereço das variáveis OTEL_* padrão
+// (ex.: OTEL_EXPORTER_OTLP_ENDPOINT). Os adaptadores recebem só o
+// trace.Tracer e o propagador; os testes trocam o provider com fx.Decorate.
+var TracingModule = fx.Module("tracing",
+	fx.Provide(
+		func(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (trace.TracerProvider, error) {
+			tp, shutdown, err := observability.NewTracerProvider(context.Background(), observability.TracingConfig{
+				Enabled: cfg.Tracing.Enabled, InstanceID: cfg.InstanceID,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if cfg.Tracing.Enabled {
+				// falhas de exportação no log JSON, não em stderr solto
+				otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+					log.Warn("opentelemetry error", "error", err)
+				}))
+			}
+			// por último na parada (é construído antes de tudo): exporta os
+			// spans que ainda estão no buffer. Com o coletor inalcançável, o
+			// prazo próprio impede que a parada espere os retries do
+			// exportador; perder spans não é falha de desligamento.
+			lc.Append(fx.Hook{OnStop: func(ctx context.Context) error {
+				ctx, cancel := context.WithTimeout(ctx, tracingShutdownTimeout)
+				defer cancel()
+				if err := shutdown(ctx); err != nil {
+					log.Warn("tracing shutdown: spans not exported", "error", err)
+				}
+				return nil
+			}})
+			log.Info("tracing configured", "enabled", cfg.Tracing.Enabled)
+			return tp, nil
+		},
+		func(tp trace.TracerProvider) trace.Tracer { return tp.Tracer(observability.TracerName) },
+		func() propagation.TextMapPropagator { return observability.Propagator },
+	),
+)
+
+// tracingShutdownTimeout limita a descarga final de spans.
+const tracingShutdownTimeout = 5 * time.Second
+
 // collectTimeout limita cada consulta feita durante uma coleta de métricas.
 const collectTimeout = 2 * time.Second
 
@@ -104,13 +151,14 @@ var PostgresModule = fx.Module("postgres",
 	fx.Provide(func(p *pgxpool.Pool) app.Store { return postgres.NewStore(p) }),
 )
 
-func newPool(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (*pgxpool.Pool, error) {
+func newPool(lc fx.Lifecycle, cfg config.Config, log *slog.Logger, tr trace.Tracer) (*pgxpool.Pool, error) {
 	pool, err := postgres.NewPool(postgres.PoolConfig{
 		URL:              cfg.Database.URL,
 		MaxConns:         cfg.Database.MaxConns,
 		StatementTimeout: cfg.Database.StatementTimeout,
 		LockTimeout:      cfg.Database.LockTimeout,
 		ApplicationName:  "wallet-" + cfg.InstanceID,
+		Tracer:           postgres.QueryTracer{Tracer: tr},
 	})
 	if err != nil {
 		return nil, err
@@ -241,7 +289,7 @@ func outboxModule(cfg config.Config) fx.Option {
 }
 
 func registerOutboxPublisher(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, store app.Store,
-	clock app.Clock, metrics app.Metrics, log *slog.Logger) {
+	clock app.Clock, metrics app.Metrics, log *slog.Logger, tr trace.Tracer, prop propagation.TextMapPropagator) {
 	var eventsURL atomic.Pointer[string]
 	svc := app.NewOutboxService(store,
 		sqsconsumer.Publisher{API: client, QueueURL: func() string {
@@ -249,7 +297,7 @@ func registerOutboxPublisher(lc fx.Lifecycle, cfg config.Config, client *sqs.Cli
 				return *p
 			}
 			return ""
-		}},
+		}, Tracer: tr, Propagator: prop},
 		clock, app.OutboxConfig{
 			Owner: cfg.InstanceID, BatchSize: cfg.Outbox.BatchSize, Lease: cfg.Outbox.Lease,
 			PerAggregate: cfg.Outbox.PerAggregate, Parallelism: cfg.Outbox.Parallelism,
@@ -340,7 +388,7 @@ func registerQueueDepth(p *observability.Prometheus, client *sqs.Client, queues 
 }
 
 func registerSQSConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client, queues *sqsQueues,
-	svc *app.WagerService, metrics sqsconsumer.Metrics, log *slog.Logger) {
+	svc *app.WagerService, metrics sqsconsumer.Metrics, log *slog.Logger, tr trace.Tracer, prop propagation.TextMapPropagator) {
 	var consumer *sqsconsumer.Consumer
 	lc.Append(fx.Hook{
 		// valida a dependência na partida: as filas precisam existir
@@ -366,6 +414,7 @@ func registerSQSConsumer(lc fx.Lifecycle, cfg config.Config, client *sqs.Client,
 				Pollers: cfg.SQS.Pollers, MaxMessages: int32(cfg.SQS.MaxMessages), WaitTime: cfg.SQS.WaitTime,
 				ItemTimeout: cfg.HTTP.RequestTimeout, RetryBaseDelay: cfg.SQS.RetryBaseDelay,
 				RetryMaxDelay: cfg.SQS.RetryMaxDelay, AllowedProviders: allowed, Metrics: metrics,
+				Tracer: tr, Propagator: prop,
 			}, client, svc, log, sqsconsumer.Hooks{})
 			return consumer.Start(ctx)
 		},

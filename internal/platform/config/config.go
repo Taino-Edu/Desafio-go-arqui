@@ -23,6 +23,7 @@ type Config struct {
 	Auth       Auth
 	SQS        SQS
 	Outbox     Outbox
+	Tracing    Tracing
 
 	StartTimeout    time.Duration // prazo para todas as dependências subirem
 	ShutdownTimeout time.Duration // prazo para concluir o trabalho em andamento
@@ -34,6 +35,13 @@ type HTTP struct {
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
 	IdleTimeout    time.Duration
+}
+
+// Tracing liga o OpenTelemetry. Endpoint, protocolo e amostragem seguem as
+// variáveis padrão do OpenTelemetry (OTEL_EXPORTER_OTLP_ENDPOINT,
+// OTEL_TRACES_SAMPLER...), lidas pelo próprio SDK.
+type Tracing struct {
+	Enabled bool
 }
 
 // Outbox configura o publicador da outbox. Usa a conexão SQS (região,
@@ -150,6 +158,9 @@ func Load(getenv func(string) string) (Config, error) {
 			Lease:          r.dur("OUTBOX_LEASE", 30*time.Second),
 			RetryBaseDelay: r.dur("OUTBOX_RETRY_BASE_DELAY", time.Second),
 			RetryMaxDelay:  r.dur("OUTBOX_RETRY_MAX_DELAY", 5*time.Minute),
+		},
+		Tracing: Tracing{
+			Enabled: r.bool("TRACING_ENABLED", false),
 		},
 		Auth: Auth{
 			Issuer:   r.str("OIDC_ISSUER", ""),

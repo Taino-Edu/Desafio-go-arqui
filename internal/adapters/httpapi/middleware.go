@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
 )
@@ -28,6 +30,7 @@ func withCorrelation(next http.Handler) http.Handler {
 			id = uuid.NewString()
 		}
 		w.Header().Set(HeaderCorrelationID, id)
+		trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("correlation.id", id))
 		next.ServeHTTP(w, r.WithContext(app.WithCorrelationID(r.Context(), id)))
 	})
 }

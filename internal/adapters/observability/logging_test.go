@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/Taino-Edu/Desafio-go-arqui/internal/app"
 )
 
@@ -44,5 +46,32 @@ func TestContextHandler_AddsCorrelationID(t *testing.T) {
 	// o id aparece uma vez só (nenhuma chave duplicada no JSON)
 	if strings.Count(lines[0], `"correlationId"`) != 1 {
 		t.Errorf("correlationId duplicado: %s", lines[0])
+	}
+}
+
+// Com um span no contexto, o log leva traceId e spanId: do log se chega ao
+// trace no Jaeger.
+func TestContextHandler_AddsTraceIDs(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(NewContextHandler(slog.NewJSONHandler(&buf, nil)))
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: trace.TraceID{0x4b, 0xf9, 1}, SpanID: trace.SpanID{0x00, 0xf0, 2}, TraceFlags: trace.FlagsSampled,
+	})
+	log.InfoContext(trace.ContextWithSpanContext(context.Background(), sc), "com span")
+	log.Info("sem span")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	var with, without map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &with); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &without); err != nil {
+		t.Fatal(err)
+	}
+	if with["traceId"] != sc.TraceID().String() || with["spanId"] != sc.SpanID().String() {
+		t.Errorf("log com span = %v", with)
+	}
+	if _, ok := without["traceId"]; ok {
+		t.Errorf("sem span não há traceId: %v", without)
 	}
 }

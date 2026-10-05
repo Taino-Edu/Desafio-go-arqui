@@ -52,7 +52,7 @@ Para executar, veja o [README](README.md).
 | inbox, SQS, DLQ | [Inbox, SQS e DLQ](#inbox-sqs-e-dlq) |
 | outbox | [Outbox](#outbox-publicação-de-eventos) |
 | reconciliação | [Reconciliação](#reconciliação) |
-| logs, métricas, health | [Observabilidade](#observabilidade-métricas-e-logs) |
+| logs, métricas, traces | [Observabilidade](#observabilidade-métricas-logs-e-traces) |
 | quedas e recuperação | [Caos, quedas e recuperação](#caos-quedas-e-recuperação) |
 | o que foi interpretado, o que falta | [Interpretações](#interpretações-adotadas), [Limitações](#limitações), [Trabalho não concluído](#trabalho-não-concluído) |
 
@@ -515,7 +515,7 @@ indisponibilidade transitória (`503`).
 | `POST /wallets/{walletId}/reconciliation` | `200` com o resultado, inclusive divergente (ver [Reconciliação](#reconciliação)) |
 | `GET /health/live` | `200` sempre que o processo responde |
 | `GET /health/ready` | `200` com Postgres (e SQS, se ligado) ok; `503` se indisponível ou desligando. Cada verificação roda em paralelo com o próprio prazo (2s) |
-| `GET /metrics` | `200`, formato de exposição do Prometheus (público, ver [Observabilidade](#observabilidade-métricas-e-logs)) |
+| `GET /metrics` | `200`, formato de exposição do Prometheus (público, ver [Observabilidade](#observabilidade-métricas-logs-e-traces)) |
 
 - **Paginação:** ordem crescente de `walletVersion` (estável: lançamentos novos
   só entram no fim). O cursor é opaco (`base64url("v1:<versão>")`).
@@ -1093,11 +1093,13 @@ leituras).
 
 ---
 
-## Observabilidade: métricas e logs
+## Observabilidade: métricas, logs e traces
 
 Arquivos: [`app/metrics.go`](internal/app/metrics.go) (porta),
-[`adapters/observability`](internal/adapters/observability) (Prometheus e
-slog), [`httpapi/observability.go`](internal/adapters/httpapi/observability.go).
+[`adapters/observability`](internal/adapters/observability) (Prometheus,
+slog e TracerProvider), [`httpapi/observability.go`](internal/adapters/httpapi/observability.go),
+`tracing.go` em [`postgres`](internal/adapters/postgres/tracing.go) e
+[`sqsconsumer`](internal/adapters/sqsconsumer/tracing.go).
 
 ### Portas e adaptador
 
@@ -1184,13 +1186,66 @@ medido como `500`.
   reconciliação registra só a diferença).
 - Health checks e coletas de métricas são logados em `DEBUG` (chegam a cada
   poucos segundos e afogariam os logs).
+- Com tracing ligado, todo log feito com o contexto leva também `traceId` e
+  `spanId`: do log se chega ao trace no Jaeger.
+
+### Traces (OpenTelemetry)
+
+Um trace acompanha a operação de ponta a ponta, inclusive através do
+intervalo assíncrono da outbox:
+
+```text
+POST /wagering/transactions            (server; continua o traceparent do cliente)
+├── db BEGIN / SELECT ... FOR UPDATE / INSERT / UPDATE / COMMIT   (um span por comando)
+├── publish WagerTransactionProcessed  (producer; ms ou s depois, por um worker)
+└── publish WalletBalanceChanged       ──► traceparent nos atributos da mensagem SQS
+
+process WagerTransactionRequested      (consumer; continua o traceparent da mensagem)
+└── db ...
+```
+
+| Peça | Decisão |
+|---|---|
+| propagação | W3C Trace Context (`traceparent`/`tracestate`) e Baggage: no cabeçalho HTTP e nos atributos das mensagens SQS (entrada e saída) |
+| HTTP | `withTracing` é o primeiro middleware: extrai o contexto, abre o span `server`; `withMetrics` dá o nome da ROTA (`GET /wallets/{walletId}`), nunca o caminho com o id; 5xx marca erro; `correlation.id` vira atributo. Health checks e `/metrics` não geram trace (mesma razão do `DEBUG` nos logs) |
+| SQL | `pgx.QueryTracer` no pool: um span `client` por comando, com o SQL (parâmetros `$1`... ficam de fora, então valores e ids não vazam). Só cria span se já existe um trace: as varreduras periódicas dos workers não geram traces soltos a cada 500 ms |
+| outbox | o problema: a publicação roda depois, em outro goroutine e talvez em outra instância, sem o contexto da requisição. Solução: `Append` grava o `traceparent` do span atual na coluna `trace_parent` (migration 000004, `CHECK` com o formato W3C, imutável pelo trigger como o resto do evento), **na mesma transação** do evento. O publicador lê a coluna, abre `publish <evento>` como filho dela e injeta o `traceparent` desse span na mensagem |
+| consumidor SQS | pede os atributos `traceparent`/`tracestate` no `ReceiveMessage` e abre `process <tipo>` (`consumer`) como filho do produtor; sem atributo, o span é raiz |
+| exportação | `TRACING_ENABLED=false` (padrão): provider no-op, custo desprezível. Ligado: SDK com `BatchSpanProcessor` e exportador OTLP/HTTP, configurado pelas variáveis `OTEL_*` padrão (endpoint, amostragem); `service.name=wallet`, `service.instance.id=INSTANCE_ID`. O `shutdown` do provider é o último hook do Fx: descarrega os spans pendentes no desligamento |
+| arquitetura | domínio e casos de uso não importam OpenTelemetry: o contexto atravessa `app` como `context.Context` e o `TraceParent` da outbox é uma string opaca para a aplicação. Só adaptadores e `fxapp` conhecem a biblioteca |
+| local | Jaeger all-in-one no compose (UI `:16686`, OTLP `:4318`) |
+
+Sem coletor no ar a API segue: a exportação roda em segundo plano, o erro
+vai para o log (`opentelemetry error`) e o lote é descartado; nenhum caminho
+de negócio espera pelo tracing (medido com o coletor num endereço que não
+responde: requisição em 11 ms). A descarga final no desligamento tem prazo
+próprio de 5 s e, se estourar, vira um `WARN`, não uma falha de parada.
+
+Escolhas e limites:
+
+- Instrumentação manual (sem `otelhttp`/`otelpgx`): são cerca de 200 linhas, sem
+  dependência a mais, e controlam exatamente o nome do span (rota), o que
+  não entra nele (valores) e quando NÃO criar span (workers, health).
+- Um span por comando SQL e não um span por "transação de negócio": o
+  agrupamento já é o span HTTP/consumer; um span `tx` intermediário
+  acrescentaria um nível sem informação nova.
+- O worker de referências pendentes conclui operações sem requisição de
+  origem: esses eventos saem sem `trace_parent` (e sem span `publish`). O
+  mesmo limite do `correlationId` (ver Logs).
+- Amostragem fica a cargo de `OTEL_TRACES_SAMPLER` (`parentbased_*` respeita
+  a decisão de quem chamou). O `trace_parent` gravado leva a flag `sampled`,
+  então a publicação segue a decisão tomada na requisição.
 
 ### Testes
 
 | Teste | Comprova |
 |---|---|
 | `observability/prometheus_test.go` | cada método da porta vira a série esperada; séries fixas em zero; método normalizado; gauges lidos na coleta; coletor com erro não derruba a página |
-| `observability/logging_test.go` | `correlationId` do contexto em todo log, inclusive em loggers derivados (`With`), sem duplicar |
+| `observability/logging_test.go` | `correlationId` do contexto em todo log, inclusive em loggers derivados (`With`), sem duplicar; `traceId`/`spanId` quando há span |
+| `httpapi/tracing_test.go` | span continua o `traceparent` do cliente (pai remoto), nome = rota, status, 5xx/panic como erro, `correlation.id`; health sem span |
+| `postgres/tracing_test.go` | span por comando só com trace em andamento; SQL compactado; erro marcado; nunca encerra o span da requisição; `traceparent` gravado na outbox |
+| `sqsconsumer/publisher_test.go` | `publish` filho do `trace_parent` gravado; `traceparent` da mensagem aponta para o span `publish`; evento sem trace não ganha span; falha de envio (lote ou entrada) marca erro e todo span é encerrado |
+| `TestTracing_EndToEnd` | pela aplicação real com Postgres e LocalStack: HTTP com `traceparent` → spans SQL filhos → `trace_parent` na outbox → `publish` no mesmo trace → `traceparent` na mensagem do SQS; log com `traceId`; mensagem de entrada com `traceparent` → span do consumidor e SQL no trace do produtor |
 | `httpapi/observability_test.go` | pela pilha completa de middlewares: rota = padrão, `unmatched` em 404/405, panic medido como 500 |
 | `app/metrics_test.go` | retries e conflitos contados por tentativa (conflito ≠ banco fora); aritmética da reconciliação |
 | `TestMetrics_ExposeOutcomesAndBacklog` | pela aplicação real: desfechos por status e porta, replay, conflito, latência, pendência resolvida pelo worker, atraso da outbox, rotas HTTP; nenhum id em `/metrics` |
@@ -1363,7 +1418,6 @@ Itens fora do escopo entregue, em ordem de prioridade para produção:
 3. **Alertas** sobre as métricas existentes (`outbox_lag_seconds`,
    `sqs_queue_messages{queue="dlq"}`, `reconciliation_mismatch_total`,
    `wallet_lock_conflicts_total`) e ferramenta para reprocessar a DLQ.
-4. **Tracing com OpenTelemetry** (diferencial opcional do enunciado).
-5. **Partidas dobradas** (diferencial opcional): hoje o ledger é de entrada
+4. **Partidas dobradas** (diferencial opcional): hoje o ledger é de entrada
    simples por carteira.
-6. **Rate limiting** por provedor e Keycloak em modo de produção.
+5. **Rate limiting** por provedor e Keycloak em modo de produção.

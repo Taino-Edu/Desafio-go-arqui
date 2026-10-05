@@ -97,9 +97,23 @@ func Message(messageID string, data map[string]any) string {
 // do produtor (o SQS FIFO só deduplica dentro de 5 minutos e pelo mesmo id).
 func (q *Queues) Send(body, groupID, dedupID string) {
 	q.t.Helper()
+	q.SendWithAttributes(body, groupID, dedupID, nil)
+}
+
+// SendWithAttributes é o Send com atributos de mensagem (ex.: traceparent).
+func (q *Queues) SendWithAttributes(body, groupID, dedupID string, attrs map[string]string) {
+	q.t.Helper()
+	var ma map[string]types.MessageAttributeValue
+	for k, v := range attrs {
+		if ma == nil {
+			ma = map[string]types.MessageAttributeValue{}
+		}
+		ma[k] = types.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(v)}
+	}
 	_, err := q.Client.SendMessage(context.Background(), &sqs.SendMessageInput{
 		QueueUrl: aws.String(q.URL), MessageBody: aws.String(body),
 		MessageGroupId: aws.String(groupID), MessageDeduplicationId: aws.String(dedupID),
+		MessageAttributes: ma,
 	})
 	if err != nil {
 		q.t.Fatalf("send: %v", err)

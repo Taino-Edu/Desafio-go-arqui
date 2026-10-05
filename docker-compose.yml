@@ -1,4 +1,5 @@
-# Ambiente local: PostgreSQL, migrations, LocalStack (SQS) e Keycloak (OIDC).
+# Ambiente local: PostgreSQL, migrations, LocalStack (SQS), Keycloak (OIDC) e
+# Jaeger (traces, UI em http://localhost:16686).
 # Credenciais aqui são de DESENVOLVIMENTO LOCAL (ver .env.example).
 #
 #   docker compose up -d          # sobe tudo e aplica as migrations
@@ -86,6 +87,16 @@ services:
       timeout: 5s
       retries: 40
 
+  # Recebe os traces da API por OTLP/HTTP (4318) e os mostra na UI (16686).
+  # Guarda em memória: some ao reiniciar.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+      - "${OTLP_HTTP_PORT:-4318}:4318"
+
   # API de carteiras. Sobe depois que as migrations terminaram com sucesso.
   app:
     build:
@@ -99,6 +110,8 @@ services:
         condition: service_healthy
       localstack:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     environment:
       INSTANCE_ID: app-1
       HTTP_ADDR: ":8080"
@@ -124,6 +137,10 @@ services:
       # publicador da outbox -> fila de eventos (usa a mesma conexão SQS)
       OUTBOX_PUBLISHER_ENABLED: "true"
       OUTBOX_QUEUE: wallet-events.fifo
+      # traces -> Jaeger. Sem coletor no ar a API segue normalmente (os
+      # spans são descartados depois de tentar exportar).
+      TRACING_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports:
       - "${APP_PORT:-8080}:8080"
     # o compose espera até 30s pelo shutdown gracioso antes de matar

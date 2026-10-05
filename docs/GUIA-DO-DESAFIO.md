@@ -765,7 +765,7 @@ outbox_events  (event_id PK; índice em next_attempt_at WHERE published_at IS NU
   `outbox_lag_seconds` (idade do evento não publicado mais antigo),
   `wager_processing_duration_seconds` (histograma), `reconciliation_mismatch_total`.
   Lista completa e decisões no
-  [ARCHITECTURE.md](../ARCHITECTURE.md#observabilidade-métricas-e-logs).
+  [ARCHITECTURE.md](../ARCHITECTURE.md#observabilidade-métricas-logs-e-traces).
 - **Health:** `/health/live` sempre 200 se o processo está de pé;
   `/health/ready` faz `SELECT 1` no Postgres e `GetQueueAttributes` no SQS.
 

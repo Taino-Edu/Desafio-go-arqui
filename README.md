@@ -15,6 +15,7 @@ com várias instâncias ao mesmo tempo.
 | sem lost update | `SELECT ... FOR UPDATE` por carteira + versão no `UPDATE` + triggers; nenhum lock em memória |
 | eventos confiáveis | transactional outbox: gravados no mesmo commit, publicados depois, at-least-once |
 | quem pode o quê | OAuth 2.0/OIDC (Keycloak), `client_credentials`; o provedor vem do token |
+| rastreável | OpenTelemetry: um trace vai da requisição (ou mensagem) ao SQL e à publicação do evento, que leva o `traceparent` adiante |
 | prova | testes com Postgres, Keycloak e LocalStack reais, 3 processos, `kill -9`, dependências fora do ar |
 
 ## Documentação
@@ -69,6 +70,7 @@ reconciliação e métricas.
 | PostgreSQL | `localhost:5432/wallet` | app `wallet_app/wallet_app`, migrations `wallet_owner/wallet_owner`, admin `postgres/postgres` |
 | LocalStack (SQS) | `http://localhost:4566` | `test/test` |
 | Keycloak | `http://localhost:8081` | admin `admin/admin`; realm `wallet` |
+| Jaeger (traces) | `http://localhost:16686` | — |
 
 As portas podem ser trocadas copiando [`.env.example`](.env.example) para `.env`.
 
@@ -129,10 +131,22 @@ curl -s localhost:8080/metrics        # público, formato Prometheus
 ```
 
 Métricas mais úteis (lista completa e decisões em
-[ARCHITECTURE.md](ARCHITECTURE.md#observabilidade-métricas-e-logs)):
+[ARCHITECTURE.md](ARCHITECTURE.md#observabilidade-métricas-logs-e-traces)):
 
 ```sh
 curl -s localhost:8080/metrics | grep -E '^(wager_transactions_total|idempotent_replays_total|wallet_lock_conflicts_total|sqs_messages_total|sqs_queue_messages|outbox_lag_seconds|outbox_pending_events|reconciliation_mismatch_total)'
+```
+
+Traces: abra o Jaeger em `http://localhost:16686`, serviço `wallet`. Uma
+operação aparece como `POST /wagering/transactions` com um span por comando
+SQL e, logo depois, os spans `publish <evento>` da outbox, no mesmo trace.
+Mande um `traceparent` (W3C) para pendurar o trace no do seu cliente; os
+logs de cada requisição trazem `traceId` para ir do log ao trace:
+
+```sh
+curl -s -X POST localhost:8080/wagering/transactions -H "Authorization: Bearer $PROVIDER_A" \
+  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' ...
+# Jaeger: http://localhost:16686/trace/4bf92f3577b34da6a3ce929d0e0e4736
 ```
 
 Enviar uma operação pela fila (mesmo efeito e mesma idempotência do HTTP):
@@ -202,6 +216,8 @@ código de saída 2):
 | `OUTBOX_PER_AGGREGATE` / `OUTBOX_PARALLELISM` | `20` / `8` | eventos seguidos de um agregado por rodada; envios ao SQS em paralelo |
 | `OUTBOX_LEASE` | `30s` | reserva de um evento reivindicado (recuperação de trabalho abandonado) |
 | `OUTBOX_RETRY_BASE_DELAY` / `OUTBOX_RETRY_MAX_DELAY` | `1s` / `5m` | backoff de falha de publicação |
+| `TRACING_ENABLED` | `false` (`true` no compose) | liga o OpenTelemetry; desligado, os spans são no-op |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | coletor OTLP/HTTP (Jaeger, Tempo, Collector...); as demais `OTEL_*` padrão também valem, ex.: `OTEL_TRACES_SAMPLER=parentbased_traceidratio`, `OTEL_TRACES_SAMPLER_ARG=0.1` |
 | `REFERENCE_WORKER_ENABLED` | `true` | liga o worker de referências pendentes nesta instância |
 | `REFERENCE_WORKER_INTERVAL` | `1s` | espera do worker quando não há pendência vencida |
 | `REFERENCE_RETRY_BASE_DELAY` / `REFERENCE_RETRY_MAX_DELAY` | `1s` / `5m` | backoff exponencial entre tentativas |
@@ -338,7 +354,7 @@ internal/adapters/postgres/  repositórios pgx, transação (Store), migrations
 internal/adapters/httpapi/   rotas, middlewares (inclusive autenticação), erros, health
 internal/adapters/auth/      validação de JWT do Keycloak (OIDC, JWKS)
 internal/adapters/sqsconsumer/ consumidor SQS (envelope, inbox via app, DLQ, backoff, shutdown) e publicador
-internal/adapters/observability/ métricas Prometheus (/metrics) e log com correlationId do contexto
+internal/adapters/observability/ métricas Prometheus (/metrics), log com correlationId/traceId do contexto, TracerProvider
 internal/platform/config/    configuração por variáveis de ambiente
 internal/platform/fxapp/     composição Uber Fx (único pacote que importa Fx)
 internal/worker/             loop genérico de trabalho em segundo plano (parada observável)

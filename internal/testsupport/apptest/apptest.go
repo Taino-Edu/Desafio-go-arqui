@@ -98,7 +98,8 @@ func Start(t *testing.T) *App {
 // StartOn sobe uma instância da aplicação sobre um banco existente, com a
 // configuração ajustada por mutate. Devolve também uma função para parar a
 // instância antes do fim do teste (simula reinício ou queda de instância).
-func StartOn(t *testing.T, db *pgtest.DB, mutate func(*config.Config)) (*App, func()) {
+// extra substitui peças do Fx (ex.: fx.Decorate do TracerProvider).
+func StartOn(t *testing.T, db *pgtest.DB, mutate func(*config.Config), extra ...fx.Option) (*App, func()) {
 	t.Helper()
 	cfg := Config(db.AppURL)
 	if mutate != nil {
@@ -109,7 +110,7 @@ func StartOn(t *testing.T, db *pgtest.DB, mutate func(*config.Config)) (*App, fu
 	captured := fx.Decorate(func(*slog.Logger) *slog.Logger {
 		return fxapp.NewLogger(logs, slog.LevelInfo, cfg.InstanceID)
 	})
-	app := fxtest.New(t, fxapp.New(cfg, captured, fx.Populate(&srv)))
+	app := fxtest.New(t, fxapp.New(cfg, append([]fx.Option{captured, fx.Populate(&srv)}, extra...)...))
 	app.RequireStart()
 	var once sync.Once
 	stop := func() { once.Do(app.RequireStop) }
