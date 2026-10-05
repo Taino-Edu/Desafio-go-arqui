@@ -41,7 +41,9 @@ type HTTP struct {
 type Outbox struct {
 	Enabled        bool
 	Queue          string        // fila de eventos (nome ou URL)
-	BatchSize      int           // eventos reivindicados por rodada
+	BatchSize      int           // agregados (cabeças) reivindicados por rodada
+	PerAggregate   int           // eventos seguidos de um mesmo agregado por rodada
+	Parallelism    int           // agregados publicados ao mesmo tempo
 	PollInterval   time.Duration // espera quando não há eventos
 	Lease          time.Duration // reserva de um evento reivindicado
 	RetryBaseDelay time.Duration // backoff de falha de publicação
@@ -141,7 +143,9 @@ func Load(getenv func(string) string) (Config, error) {
 		Outbox: Outbox{
 			Enabled:        r.bool("OUTBOX_PUBLISHER_ENABLED", true),
 			Queue:          r.str("OUTBOX_QUEUE", "wallet-events.fifo"),
-			BatchSize:      r.int("OUTBOX_BATCH_SIZE", 50),
+			BatchSize:      r.int("OUTBOX_BATCH_SIZE", 100),
+			PerAggregate:   r.int("OUTBOX_PER_AGGREGATE", 20),
+			Parallelism:    r.int("OUTBOX_PARALLELISM", 8),
 			PollInterval:   r.dur("OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
 			Lease:          r.dur("OUTBOX_LEASE", 30*time.Second),
 			RetryBaseDelay: r.dur("OUTBOX_RETRY_BASE_DELAY", time.Second),
@@ -215,6 +219,9 @@ func (c Config) Validate() error {
 	if c.Outbox.Enabled {
 		if c.Outbox.Queue == "" || c.Outbox.BatchSize < 1 || c.Outbox.BatchSize > 1000 {
 			errs = append(errs, errors.New("OUTBOX_QUEUE is required and OUTBOX_BATCH_SIZE must be between 1 and 1000"))
+		}
+		if c.Outbox.PerAggregate < 1 || c.Outbox.PerAggregate > 1000 || c.Outbox.Parallelism < 1 || c.Outbox.Parallelism > 256 {
+			errs = append(errs, errors.New("OUTBOX_PER_AGGREGATE must be between 1 and 1000 and OUTBOX_PARALLELISM between 1 and 256"))
 		}
 		if c.Outbox.PollInterval <= 0 || c.Outbox.Lease < time.Second {
 			errs = append(errs, errors.New("OUTBOX_POLL_INTERVAL must be positive and OUTBOX_LEASE >= 1s"))

@@ -24,6 +24,7 @@ com várias instâncias ao mesmo tempo.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | decisões técnicas, interpretações, limitações e trabalho não concluído |
 | [docs/GUIA-DO-DESAFIO.md](docs/GUIA-DO-DESAFIO.md) | guia técnico dos conceitos e roteiro de construção |
 | [docs/CONCEITOS-EXPLICADOS.md](docs/CONCEITOS-EXPLICADOS.md) | os mesmos conceitos sem jargão, com analogias e vídeos |
+| [docs/LOAD-TEST.md](docs/LOAD-TEST.md) | teste de carga: comando, ambiente, metodologia, vazão, p50/p95/p99, erros, conflitos, atraso da outbox |
 
 ## Pré-requisitos
 
@@ -197,7 +198,8 @@ código de saída 2):
 | `SQS_ALLOWED_PROVIDERS` | — (qualquer) | provedores aceitos na fila, separados por vírgula |
 | `OUTBOX_PUBLISHER_ENABLED` | `true` | liga o publicador da outbox nesta instância |
 | `OUTBOX_QUEUE` | `wallet-events.fifo` | fila de eventos (nome ou URL); usa a conexão SQS acima |
-| `OUTBOX_BATCH_SIZE` / `OUTBOX_POLL_INTERVAL` | `50` / `500ms` | eventos por rodada; espera quando não há eventos |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_POLL_INTERVAL` | `100` / `500ms` | agregados por rodada; espera quando não há eventos |
+| `OUTBOX_PER_AGGREGATE` / `OUTBOX_PARALLELISM` | `20` / `8` | eventos seguidos de um agregado por rodada; envios ao SQS em paralelo |
 | `OUTBOX_LEASE` | `30s` | reserva de um evento reivindicado (recuperação de trabalho abandonado) |
 | `OUTBOX_RETRY_BASE_DELAY` / `OUTBOX_RETRY_MAX_DELAY` | `1s` / `5m` | backoff de falha de publicação |
 | `REFERENCE_WORKER_ENABLED` | `true` | liga o worker de referências pendentes nesta instância |
@@ -307,6 +309,9 @@ go test -tags=integration -race ./internal/adapters/postgres/ ./internal/platfor
 # reconciliação (consistente, divergência simulada, sob carga), métricas, logs e disputa de lock
 go test -tags=integration -race -run 'TestReconciliation|TestMetrics|TestLogs|TestLockContention' ./test/integration/
 
+# teste de carga (ambiente do compose no ar; ver docs/LOAD-TEST.md)
+go run ./cmd/loadtest -duration 60s -concurrency 32 -wallets 200 -rate 300
+
 # fuzzing do parser de dinheiro (opcional)
 go test -run='^$' -fuzz=FuzzParse -fuzztime=30s ./internal/domain/money
 ```
@@ -321,6 +326,7 @@ vet, unitários, build da imagem e a integração completa com `-race`.
 ```
 cmd/server/                  API HTTP (Uber Fx)
 cmd/migrate/                 aplica/reverte migrations
+cmd/loadtest/                gerador de carga (vazão, p50/p95/p99, conflitos, atraso da outbox)
 internal/domain/
   money/                     value object Money (centavos em int64, sem float)
   wallet/                    carteira (raiz do agregado) e lançamento de ledger

@@ -1,7 +1,9 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,42 +13,81 @@ import (
 
 // Claim reivindica eventos para publicação.
 //
-//   - heads: o evento pendente mais antigo (menor seq) de cada agregado. Só
-//     ele pode ser publicado; o seguinte espera, o que mantém a ordem por
-//     agregado mesmo com várias instâncias publicando.
-//   - ready: entre as cabeças, as que já podem ser tentadas (next_attempt_at
-//     vencido) e não estão arrendadas por ninguém (ou o arrendamento venceu:
-//     trabalho abandonado). FOR UPDATE SKIP LOCKED: cada instância pega
-//     linhas diferentes. published_at IS NULL é conferido de novo aqui
-//     porque, em READ COMMITTED, a linha é reavaliada na versão mais recente.
+// Toda parte da consulta tem custo limitado pelo tamanho do lote, nunca pelo
+// acúmulo, mesmo com estatísticas desatualizadas. Isso importa: logo depois
+// de um pico, o Postgres ainda "acha" que quase nada está pendente e escolhe
+// planos que seriam baratos com 1 pendente e são quadráticos com 40 mil (o
+// teste de carga mostrou a publicação parar por statement_timeout; ver
+// docs/LOAD-TEST.md e TestOutbox_ClaimScalesWithBacklog).
+//
+//   - ready: percorre os pendentes em ordem de gravação e fica com as
+//     "cabeças" (o pendente de menor seq do seu agregado), já prontas
+//     (next_attempt_at vencido) e sem arrendamento válido (ou com
+//     arrendamento vencido: trabalho abandonado). A cabeça é conferida por
+//     uma subconsulta ORDER BY seq LIMIT 1: qualquer índice que o
+//     planejador escolha para ela para cedo. Para ao juntar heads cabeças.
+//     FOR UPDATE SKIP LOCKED: cada instância pega cabeças diferentes.
+//   - win: os primeiros window pendentes em ordem de gravação (leitura
+//     limitada), numerados por agregado. Os eventos de um agregado que caem
+//     na janela são sempre os primeiros dele (rn = 1 é a cabeça), então a
+//     sequência é contínua. Uma só ordenação; nenhuma junção por
+//     desigualdade (com 500 cabeças, a junção anterior fazia 2,5 milhões de
+//     comparações).
+//   - candidates: quem fica com a cabeça é dono do agregado nesta rodada e
+//     leva também os eventos seguintes dele que estão na janela, até
+//     perAggregate no total, parando no primeiro que não estiver pronto. O
+//     filtro "agregado é meu" é um IN, resolvido por hash.
+//     Nenhuma outra instância disputa esses eventos: elas só reivindicam
+//     cabeças, e a cabeça está com o dono; quando ela é publicada, o
+//     seguinte já está arrendado por ele.
 //   - UPDATE: grava o arrendamento e conta a tentativa.
-func (r outboxRepo) Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]app.OutboxMessage, error) {
+func (r outboxRepo) Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, heads, perAggregate int) ([]app.OutboxMessage, error) {
+	window := min(max(heads*perAggregate, heads), maxClaimWindow)
 	rows, err := r.q.Query(ctx, `
-		WITH heads AS (
-			SELECT DISTINCT ON (aggregate_id) event_id
-			  FROM outbox_events
-			 WHERE published_at IS NULL
-			 ORDER BY aggregate_id, seq
-		), ready AS (
-			SELECT e.event_id
+		WITH ready AS (
+			SELECT e.event_id, e.aggregate_id, e.seq
 			  FROM outbox_events e
-			  JOIN heads h ON h.event_id = e.event_id
 			 WHERE e.published_at IS NULL
 			   AND e.next_attempt_at <= $1
 			   AND (e.locked_until IS NULL OR e.locked_until < $1)
+			   AND e.seq = (
+			       SELECT p.seq FROM outbox_events p
+			        WHERE p.aggregate_id = e.aggregate_id AND p.published_at IS NULL
+			        ORDER BY p.seq
+			        LIMIT 1)
 			 ORDER BY e.seq
 			 LIMIT $4
 			 FOR UPDATE OF e SKIP LOCKED
+		), win AS MATERIALIZED (
+			SELECT event_id, aggregate_id,
+			       row_number() OVER x AS rn,
+			       bool_and(ok) OVER x AS contiguous
+			  FROM (SELECT event_id, aggregate_id, seq,
+			               next_attempt_at <= $1 AND (locked_until IS NULL OR locked_until < $1) AS ok
+			          FROM outbox_events
+			         WHERE published_at IS NULL
+			         ORDER BY seq
+			         LIMIT $6) pending
+			WINDOW x AS (PARTITION BY aggregate_id ORDER BY seq ROWS UNBOUNDED PRECEDING)
+		), candidates AS (
+			SELECT event_id FROM win
+			 WHERE rn BETWEEN 2 AND $5
+			   AND contiguous
+			   AND aggregate_id IN (SELECT aggregate_id FROM ready)
+		), claim AS (
+			SELECT event_id FROM ready
+			UNION ALL
+			SELECT event_id FROM candidates
 		)
 		UPDATE outbox_events o
 		   SET locked_until = $1 + ($2 * interval '1 millisecond'),
 		       locked_by = $3,
 		       attempts = o.attempts + 1
-		  FROM ready
-		 WHERE o.event_id = ready.event_id
+		  FROM claim
+		 WHERE o.event_id = claim.event_id
 		RETURNING o.event_id, o.aggregate_type, o.aggregate_id, o.event_type, o.event_version,
 		          o.correlation_id, o.payload, o.occurred_at, o.attempts, o.seq`,
-		now, lease.Milliseconds(), owner, limit)
+		now, lease.Milliseconds(), owner, heads, perAggregate, window)
 	if err != nil {
 		return nil, classify(err)
 	}
@@ -70,16 +111,35 @@ func (r outboxRepo) Claim(ctx context.Context, owner string, now time.Time, leas
 		return nil, classify(err)
 	}
 	// RETURNING não garante ordem: publica na ordem de gravação
-	for i := 1; i < len(claimed); i++ {
-		for j := i; j > 0 && claimed[j].seq < claimed[j-1].seq; j-- {
-			claimed[j], claimed[j-1] = claimed[j-1], claimed[j]
-		}
-	}
+	slices.SortFunc(claimed, func(a, b withSeq) int { return cmp.Compare(a.seq, b.seq) })
 	out := make([]app.OutboxMessage, len(claimed))
 	for i, c := range claimed {
 		out[i] = c.msg
 	}
 	return out, nil
+}
+
+// maxClaimWindow limita quantos pendentes uma rodada lê para achar os
+// eventos seguintes de cada agregado.
+const maxClaimWindow = 5000
+
+// Release devolve eventos arrendados por owner, sem nova tentativa agendada.
+// Eles não chegaram a ser tentados: a contagem do Claim é desfeita, para não
+// inflar o backoff de uma falha futura.
+func (r outboxRepo) Release(ctx context.Context, owner string, eventIDs []uuid.UUID) error {
+	_, err := r.q.Exec(ctx, `
+		UPDATE outbox_events
+		   SET locked_until = NULL, locked_by = NULL, attempts = GREATEST(attempts - 1, 0)
+		 WHERE event_id = ANY($1) AND locked_by = $2 AND published_at IS NULL`, eventIDs, owner)
+	return classify(err)
+}
+
+func (r outboxRepo) MarkPublishedMany(ctx context.Context, eventIDs []uuid.UUID, now time.Time) error {
+	_, err := r.q.Exec(ctx, `
+		UPDATE outbox_events
+		   SET published_at = $2, locked_until = NULL, locked_by = NULL, last_error = NULL
+		 WHERE event_id = ANY($1) AND published_at IS NULL`, eventIDs, now)
+	return classify(err)
 }
 
 func (r outboxRepo) MarkPublished(ctx context.Context, eventID uuid.UUID, now time.Time) error {

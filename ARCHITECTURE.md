@@ -947,30 +947,54 @@ commit, e nada confirmado se perde.
 ```
 transação de negócio  ── INSERT outbox_events (seq, payload, next_attempt_at = occurred_at)  ── COMMIT
 publicador            ── Claim (transação curta, confirmada): attempts+1, locked_by, locked_until = agora + lease
-                      ── SendMessage para wallet-events.fifo   (fora de transação)
-                      ── sucesso: published_at = agora, libera o arrendamento
-                      ── falha:   next_attempt_at = agora + backoff, last_error, libera o arrendamento
+                      ── ondas de SendMessageBatch para wallet-events.fifo   (fora de transação)
+                      ── sucesso: published_at = agora (um UPDATE por onda), libera o arrendamento
+                      ── falha:   next_attempt_at = agora + backoff, last_error; os seguintes do agregado são liberados
 ```
 
 ### Reivindicação (`Claim`)
 
 - **Ordem por agregado:** só o evento pendente de menor `seq` de cada agregado
-  (a "cabeça") pode ser reivindicado; o seguinte espera a cabeça ser
-  publicada. `seq` é uma coluna identidade atribuída no `INSERT` (migration
-  000002); como os eventos de uma carteira são gravados com a carteira
-  travada, `seq` segue a ordem das versões da carteira sem depender do relógio
-  das instâncias.
+  (a "cabeça") pode ser reivindicado por quem não é dono do agregado. `seq` é
+  uma coluna identidade atribuída no `INSERT` (migration 000002); como os
+  eventos de uma carteira são gravados com a carteira travada, `seq` segue a
+  ordem das versões da carteira sem depender do relógio das instâncias.
+- **Dono do agregado na rodada:** quem reivindica a cabeça leva também os
+  eventos seguintes do mesmo agregado (até `OUTBOX_PER_AGGREGATE`, padrão 20),
+  enquanto a sequência é contínua. Nenhuma outra instância disputa esses
+  eventos: elas só reivindicam cabeças, e a cabeça está com o dono.
 - **Vários publicadores:** `FOR UPDATE SKIP LOCKED` faz cada instância pegar
   cabeças diferentes, sem esperar.
+- **Custo limitado pelo lote, não pelo acúmulo**, mesmo com estatísticas
+  desatualizadas (o caso logo depois de um pico): a cabeça é conferida por uma
+  subconsulta `ORDER BY seq LIMIT 1` e os seguintes vêm de uma janela limitada
+  dos pendentes mais antigos, numerada por agregado (migration 000003, índice
+  parcial por `seq`). Achado e medido pelo [teste de carga](docs/LOAD-TEST.md);
+  regressão em `TestOutbox_ClaimScalesWithBacklog`.
+- **Lote:** `OUTBOX_BATCH_SIZE` agregados por rodada (padrão 100). O custo da
+  reivindicação cresce com o quadrado do lote no pior caso (12 ms com 50,
+  35 ms com 100, 464 ms com 500), então lotes maiores pioram.
 - **Arrendamento (lease, `OUTBOX_LEASE`, padrão 30s):** a reserva é gravada e
   confirmada antes da publicação. Enquanto vale, ninguém mais pega o evento;
   se a instância cair, o arrendamento vence e outra instância o retoma
   (trabalho abandonado).
-- **Backoff:** `min(OUTBOX_RETRY_BASE_DELAY × 2^(tentativas−1), OUTBOX_RETRY_MAX_DELAY)`
-  (1s até 5min). Não há limite de tentativas nem estado "morto": um evento
-  confirmado nunca é descartado. Uma cabeça que falha segura os eventos
-  seguintes do mesmo agregado (head-of-line), o que preserva a ordem; os
-  outros agregados seguem.
+
+### Publicação em ondas
+
+- A onda *n* leva o *n*-ésimo evento de cada agregado reivindicado, em lotes
+  de até 10 (`SendMessageBatch`) e até `OUTBOX_PARALLELISM` (padrão 8)
+  chamadas ao mesmo tempo. Num lote nunca há dois eventos do mesmo agregado,
+  então uma falha parcial não fura a ordem; a onda *n+1* só sai depois da *n*.
+- Os publicados de cada onda são marcados num único `UPDATE`.
+- **Falha:** o evento recebe backoff
+  `min(OUTBOX_RETRY_BASE_DELAY × 2^(tentativas−1), OUTBOX_RETRY_MAX_DELAY)`
+  (1s até 5min) e os seguintes do mesmo agregado são devolvidos na hora (sem
+  contar tentativa), para esperar atrás dele. Não há limite de tentativas nem
+  estado "morto": um evento confirmado nunca é descartado. Uma cabeça que
+  falha segura os eventos seguintes do mesmo agregado (head-of-line), o que
+  preserva a ordem; os outros agregados seguem.
+- **Desligamento:** o que não começou é devolvido na hora para outra
+  instância, sem esperar o arrendamento vencer.
 
 ### Garantia de entrega
 
@@ -1003,11 +1027,15 @@ vir ou perdido no consumidor); valores monetários são strings decimais.
 | `CompetingPublishersKeepOrderPerAggregate` | 3 publicadores, 90 eventos de 5 carteiras: cada evento enviado uma vez e `walletVersion` entregue em ordem (1..9) por carteira |
 | `RecoversAbandonedClaim` | **queda entre o commit e a publicação**: a reivindicação abandonada é retomada por outra instância após o arrendamento |
 | `CrashBetweenPublishAndMarkRepublishesSameEventID` | **queda entre a publicação e a confirmação**: outra instância republica o mesmo `eventId`; a fila tem uma cópia |
-| `FailureBacksOffAndKeepsOrder` | falha registra `last_error` e agenda backoff; o segundo evento do agregado só sai depois do primeiro |
+| `FailureBacksOffAndKeepsOrder` | falha registra `last_error` e agenda backoff; o segundo evento do agregado é devolvido sem contar tentativa e só sai depois do primeiro |
+| `ClaimScalesWithBacklog` | 40 mil pendentes com estatísticas congeladas: cada rodada abaixo de 150 ms (a versão anterior levava ~600 ms) |
 
-Verificação adversarial registrada: removendo a regra da "cabeça" do
-agregado, os eventos de uma carteira chegaram na ordem `[8 9 1 2 3 4 5 6 7]`
-e os dois testes de ordem falharam.
+Os testes de ordem passam pelo caminho em lote (`SendMessageBatch` no
+LocalStack real). Verificações adversariais registradas: removendo a regra
+da "cabeça" do agregado, os eventos de uma carteira chegaram na ordem
+`[8 9 1 2 3 4 5 6 7]`; publicando os eventos de um agregado em paralelo, ou
+tudo numa onda só, chegaram como `[1 3 2 4 ...]`; com a consulta de
+reivindicação anterior, o teste de escala falhou.
 
 ---
 
@@ -1312,6 +1340,10 @@ Onde o enunciado deixa espaço, a escolha foi esta:
 - **Sem limite de taxa (rate limiting)** por provedor; o corpo da requisição
   é limitado a 64 KiB.
 - **Moedas com 2 casas decimais apenas.**
+- **Teste de carga numa máquina só** (gerador, API, banco e LocalStack
+  dividindo 4 CPUs): os números são relativos. Na capacidade máxima, o
+  atraso da outbox cresce durante o pico (ver
+  [docs/LOAD-TEST.md](docs/LOAD-TEST.md)).
 - **Testes de caos são probabilísticos.** O `kill -9` cai onde a carga estiver
   naquele instante; as quedas em pontos exatos ficam nos testes com ganchos
   (ver [Caos](#limites-desses-testes)).
@@ -1332,7 +1364,6 @@ Itens fora do escopo entregue, em ordem de prioridade para produção:
    `sqs_queue_messages{queue="dlq"}`, `reconciliation_mismatch_total`,
    `wallet_lock_conflicts_total`) e ferramenta para reprocessar a DLQ.
 4. **Tracing com OpenTelemetry** (diferencial opcional do enunciado).
-5. **Teste de carga** com throughput e p50/p95/p99 (diferencial opcional).
-6. **Partidas dobradas** (diferencial opcional): hoje o ledger é de entrada
+5. **Partidas dobradas** (diferencial opcional): hoje o ledger é de entrada
    simples por carteira.
-7. **Rate limiting** por provedor e Keycloak em modo de produção.
+6. **Rate limiting** por provedor e Keycloak em modo de produção.

@@ -252,6 +252,7 @@ func registerOutboxPublisher(lc fx.Lifecycle, cfg config.Config, client *sqs.Cli
 		}},
 		clock, app.OutboxConfig{
 			Owner: cfg.InstanceID, BatchSize: cfg.Outbox.BatchSize, Lease: cfg.Outbox.Lease,
+			PerAggregate: cfg.Outbox.PerAggregate, Parallelism: cfg.Outbox.Parallelism,
 			RetryBase: cfg.Outbox.RetryBaseDelay, RetryMax: cfg.Outbox.RetryMaxDelay,
 		}, app.OutboxHooks{}, app.WithMetrics(metrics))
 

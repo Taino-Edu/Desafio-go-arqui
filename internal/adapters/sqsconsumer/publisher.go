@@ -26,15 +26,17 @@ import (
 type Publisher struct {
 	API interface {
 		SendMessage(ctx context.Context, in *sqs.SendMessageInput, opts ...func(*sqs.Options)) (*sqs.SendMessageOutput, error)
+		SendMessageBatch(ctx context.Context, in *sqs.SendMessageBatchInput, opts ...func(*sqs.Options)) (*sqs.SendMessageBatchOutput, error)
 	}
 	QueueURL func() string
 }
 
-func (p Publisher) Publish(ctx context.Context, m app.OutboxMessage) error {
-	url := p.QueueURL()
-	if url == "" {
-		return fmt.Errorf("events queue not resolved")
-	}
+var _ app.BatchPublisher = Publisher{}
+
+// maxSQSBatch é o limite do SendMessageBatch.
+const maxSQSBatch = 10
+
+func attributes(m app.OutboxMessage) map[string]types.MessageAttributeValue {
 	str := func(v string) types.MessageAttributeValue {
 		return types.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(v)}
 	}
@@ -46,12 +48,70 @@ func (p Publisher) Publish(ctx context.Context, m app.OutboxMessage) error {
 	if m.CorrelationID != "" {
 		attrs["correlationId"] = str(m.CorrelationID)
 	}
+	return attrs
+}
+
+func (p Publisher) Publish(ctx context.Context, m app.OutboxMessage) error {
+	url := p.QueueURL()
+	if url == "" {
+		return fmt.Errorf("events queue not resolved")
+	}
 	_, err := p.API.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:               aws.String(url),
 		MessageBody:            aws.String(string(m.Payload)),
 		MessageGroupId:         aws.String(m.AggregateID.String()),
 		MessageDeduplicationId: aws.String(m.EventID.String()),
-		MessageAttributes:      attrs,
+		MessageAttributes:      attributes(m),
 	})
 	return err
+}
+
+// PublishBatch envia em chamadas SendMessageBatch de até 10 mensagens, com o
+// mesmo roteamento de Publish. Devolve um erro por mensagem (nil = enviada):
+// o SQS aceita ou recusa cada entrada separadamente.
+func (p Publisher) PublishBatch(ctx context.Context, msgs []app.OutboxMessage) []error {
+	errs := make([]error, len(msgs))
+	url := p.QueueURL()
+	if url == "" {
+		for i := range errs {
+			errs[i] = fmt.Errorf("events queue not resolved")
+		}
+		return errs
+	}
+	for start := 0; start < len(msgs); start += maxSQSBatch {
+		chunk := msgs[start:min(start+maxSQSBatch, len(msgs))]
+		entries := make([]types.SendMessageBatchRequestEntry, len(chunk))
+		for i, m := range chunk {
+			entries[i] = types.SendMessageBatchRequestEntry{
+				Id:                     aws.String(strconv.Itoa(start + i)),
+				MessageBody:            aws.String(string(m.Payload)),
+				MessageGroupId:         aws.String(m.AggregateID.String()),
+				MessageDeduplicationId: aws.String(m.EventID.String()),
+				MessageAttributes:      attributes(m),
+			}
+		}
+		out, err := p.API.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{QueueUrl: aws.String(url), Entries: entries})
+		if err != nil {
+			for i := range chunk {
+				errs[start+i] = err
+			}
+			continue
+		}
+		answered := map[int]bool{}
+		for _, ok := range out.Successful {
+			i, _ := strconv.Atoi(aws.ToString(ok.Id))
+			answered[i] = true
+		}
+		for _, f := range out.Failed {
+			i, _ := strconv.Atoi(aws.ToString(f.Id))
+			answered[i] = true
+			errs[i] = fmt.Errorf("sqs batch entry %s: %s", aws.ToString(f.Code), aws.ToString(f.Message))
+		}
+		for i := range chunk { // entrada sem resposta: trata como falha
+			if !answered[start+i] {
+				errs[start+i] = fmt.Errorf("sqs batch entry %d without result", start+i)
+			}
+		}
+	}
+	return errs
 }

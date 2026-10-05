@@ -120,15 +120,22 @@ type InboxRepository interface {
 type OutboxRepository interface {
 	Append(ctx context.Context, records ...OutboxRecord) error
 
-	// Claim reivindica até limit eventos prontos para publicar, com um
-	// arrendamento (lease) até now+lease em nome de owner. Pega só o evento
-	// pendente mais antigo de cada agregado (ordem por agregado), pula os que
-	// outra instância já travou (SKIP LOCKED) e retoma arrendamentos vencidos
-	// (trabalho abandonado por uma instância que caiu).
-	Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]OutboxMessage, error)
+	// Claim reivindica eventos prontos para publicar, com um arrendamento
+	// (lease) até now+lease em nome de owner. Escolhe até heads agregados cujo
+	// evento pendente mais antigo (a "cabeça") está pronto, pulando os que
+	// outra instância já travou (SKIP LOCKED) e retomando arrendamentos
+	// vencidos (trabalho abandonado). Quem fica com a cabeça é dono do
+	// agregado nesta rodada: leva também os eventos seguintes dele, em
+	// sequência, até perAggregate no total. Devolve em ordem de gravação.
+	Claim(ctx context.Context, owner string, now time.Time, lease time.Duration, heads, perAggregate int) ([]OutboxMessage, error)
+	// Release devolve eventos arrendados por owner e ainda não publicados,
+	// sem agendar nova tentativa (ficam prontos para a próxima rodada).
+	Release(ctx context.Context, owner string, eventIDs []uuid.UUID) error
 	// MarkPublished registra a publicação. Não faz nada se já estiver
 	// publicado (outra instância concluiu primeiro).
 	MarkPublished(ctx context.Context, eventID uuid.UUID, now time.Time) error
+	// MarkPublishedMany faz o mesmo para vários eventos, num comando só.
+	MarkPublishedMany(ctx context.Context, eventIDs []uuid.UUID, now time.Time) error
 	// MarkFailed libera o evento para nova tentativa em nextAttemptAt.
 	MarkFailed(ctx context.Context, eventID uuid.UUID, owner string, nextAttemptAt time.Time, cause string) error
 	// Backlog conta os eventos não publicados e devolve o occurred_at do mais
@@ -152,6 +159,13 @@ type OutboxMessage struct {
 // EventPublisher entrega um evento ao destino externo (SQS).
 type EventPublisher interface {
 	Publish(ctx context.Context, m OutboxMessage) error
+}
+
+// BatchPublisher é opcional: entrega vários eventos numa chamada e devolve um
+// erro por evento (nil = entregue), na mesma ordem. O publicador da outbox
+// só manda num mesmo lote eventos de agregados diferentes.
+type BatchPublisher interface {
+	PublishBatch(ctx context.Context, msgs []OutboxMessage) []error
 }
 
 // OutboxRecord é um evento serializado pronto para a tabela outbox_events.

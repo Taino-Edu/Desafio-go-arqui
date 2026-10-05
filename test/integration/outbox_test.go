@@ -59,6 +59,35 @@ func (r *recorder) Publish(ctx context.Context, m app.OutboxMessage) error {
 	return nil
 }
 
+// PublishBatch usa o envio em lote do publicador real (SendMessageBatch), com
+// as mesmas falhas simuladas: assim os testes de ordem cobrem o caminho em lote.
+func (r *recorder) PublishBatch(ctx context.Context, msgs []app.OutboxMessage) []error {
+	errs := make([]error, len(msgs))
+	var send []app.OutboxMessage
+	var idx []int
+	for i, m := range msgs {
+		if r.failNext.Load() > 0 {
+			r.failNext.Add(-1)
+			errs[i] = errors.New("sqs indisponível (simulado)")
+			continue
+		}
+		send, idx = append(send, m), append(idx, i)
+	}
+	if len(send) == 0 {
+		return errs
+	}
+	res := r.inner.(app.BatchPublisher).PublishBatch(ctx, send)
+	r.mu.Lock()
+	for j, err := range res {
+		errs[idx[j]] = err
+		if err == nil {
+			r.sent = append(r.sent, send[j].EventID)
+		}
+	}
+	r.mu.Unlock()
+	return errs
+}
+
 func (r *recorder) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -332,8 +361,19 @@ func TestOutbox_FailureBacksOffAndKeepsOrder(t *testing.T) {
 
 	rec.failNext.Store(2)
 	res, _ := svc.PublishBatch(ctx)
-	if res.Claimed != 1 || res.Failed != 1 {
-		t.Fatalf("1ª rodada: %+v (só a cabeça do agregado pode ser reivindicada)", res)
+	// o dono da cabeça leva também o seguinte do agregado; a cabeça falha e o
+	// seguinte é devolvido sem ser tentado, para esperar atrás dela
+	if res.Claimed != 2 || res.Failed != 1 || res.Published != 0 || len(rec.sent) != 0 {
+		t.Fatalf("1ª rodada: %+v, enviados %v", res, rec.sent)
+	}
+	var secondLocked *string
+	var secondAttempts int
+	if err := db.Owner.QueryRow(ctx, `SELECT locked_by, attempts FROM outbox_events WHERE event_id = $1`, second).
+		Scan(&secondLocked, &secondAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if secondLocked != nil || secondAttempts != 0 {
+		t.Errorf("o seguinte deveria ser liberado sem tentativa: locked_by=%v attempts=%d", secondLocked, secondAttempts)
 	}
 	var lastError string
 	var lockedBy *string
@@ -358,5 +398,72 @@ func TestOutbox_FailureBacksOffAndKeepsOrder(t *testing.T) {
 	}
 	if n := apptest.Count(t, db, `SELECT attempts FROM outbox_events WHERE event_id = $1`, first); n != 3 {
 		t.Errorf("tentativas do primeiro = %d, want 3", n)
+	}
+}
+
+// Regressão de desempenho (achada pelo teste de carga): logo depois de um
+// pico, as estatísticas do Postgres ainda dizem que quase nada está pendente,
+// e o planejador escolhe planos que só são baratos com poucos pendentes. A
+// versão anterior da reivindicação varria todos os pendentes para cada linha
+// (2 milhões de comparações para um lote de 50, com 40 mil pendentes); sob
+// carga, estourava o statement_timeout e a publicação parava.
+func TestOutbox_ClaimScalesWithBacklog(t *testing.T) {
+	db := pgtest.New(t)
+	ctx := context.Background()
+	// estatísticas congeladas: o autovacuum desta tabela fica desligado
+	if _, err := db.Owner.Exec(ctx, `ALTER TABLE outbox_events SET (autovacuum_enabled = false)`); err != nil {
+		t.Fatal(err)
+	}
+	// estado depois de um tempo de operação: muitos eventos já publicados e
+	// estatísticas coletadas com nada pendente...
+	if _, err := db.App.Exec(ctx, `
+		INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, event_version,
+			correlation_id, payload, occurred_at, next_attempt_at, published_at)
+		SELECT gen_random_uuid(), 'wallet', gen_random_uuid(), 'WalletBalanceChanged', 1, 'old', '{}'::jsonb,
+		       now(), now(), now()
+		  FROM generate_series(1, 100000)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Owner.Exec(ctx, `ANALYZE outbox_events`); err != nil {
+		t.Fatal(err)
+	}
+	// ...e então um pico: 20 mil agregados com 2 eventos seguidos cada
+	if _, err := db.App.Exec(ctx, `
+		INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, event_version,
+			correlation_id, payload, occurred_at, next_attempt_at)
+		SELECT gen_random_uuid(), 'wallet', a.agg, 'WalletBalanceChanged', 1, 'load', '{}'::jsonb, now(), now()
+		  FROM (SELECT n, gen_random_uuid() AS agg FROM generate_series(1, 20000) n) a,
+		       generate_series(1, 2) s
+		 ORDER BY a.n, s`); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := postgres.NewPool(postgres.PoolConfig{URL: db.AppURL, MaxConns: 2, StatementTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	store := postgres.NewStore(pool)
+
+	for round := range 3 {
+		start := time.Now()
+		var claimed []app.OutboxMessage
+		err := store.WithinTx(ctx, func(ctx context.Context, r app.Repositories) error {
+			var err error
+			claimed, err = r.Outbox().Claim(ctx, "p1", time.Now(), 30*time.Second, 50, 20)
+			return err
+		})
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("rodada %d: %v", round, err)
+		}
+		// 50 agregados, cada um com a cabeça e o seguinte
+		if len(claimed) != 100 {
+			t.Errorf("rodada %d: %d eventos reivindicados, want 100", round, len(claimed))
+		}
+		// a versão anterior levava ~0,5s aqui (e segundos sob carga)
+		if elapsed > 150*time.Millisecond {
+			t.Errorf("rodada %d levou %v com 40 mil pendentes (want < 150ms)", round, elapsed)
+		}
+		t.Logf("rodada %d: %d eventos em %v", round, len(claimed), elapsed.Round(time.Millisecond))
 	}
 }
